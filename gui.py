@@ -128,6 +128,14 @@ class GPT_GUI:
         # Get architecture configuration from GUI
         arch_config = self.get_architecture_config()
         
+        # Get parameter configuration
+        param_config = self.get_parameter_config()
+        if param_config is None:
+            return  # Error in parameter configuration
+        
+        # Get sampler configuration
+        sampler_config = self.get_sampler_config()
+        
         # Validate configuration
         if arch_config.attention_type == 'grouped_query' and arch_config.n_head % arch_config.n_query_groups != 0:
             messagebox.showerror("Invalid Configuration", 
@@ -139,14 +147,45 @@ class GPT_GUI:
         self.train_button.config(state="disabled")
         self.generate_button.config(state="disabled")
         
-        # Update status with architecture info
+        # Update status with configuration info
         moe_info = f" with MoE ({arch_config.moe_num_experts} experts)" if arch_config.use_moe else ""
         attn_info = f" using {arch_config.attention_type} attention"
-        self.status_text.set(f"Running optimization with {n_trials} trials{moe_info}{attn_info}...")
+        sampler_info = f" ({sampler_config['type']} sampler)"
+        self.status_text.set(f"Starting optimization: {n_trials} trials{moe_info}{attn_info}{sampler_info}")
         
         # Clear log
         self.optim_log_text.config(state="normal")
         self.optim_log_text.delete("1.0", tk.END)
+        self.optim_log_text.insert(tk.END, f"=== HYPERPARAMETER OPTIMIZATION LOG ===\n")
+        self.optim_log_text.insert(tk.END, f"Configuration: {n_trials} trials, {steps_per_trial} steps per trial\n")
+        self.optim_log_text.insert(tk.END, f"Architecture: {arch_config.attention_type} attention{moe_info}\n")
+        self.optim_log_text.insert(tk.END, f"Sampler: {sampler_config['type']}, Pruner: {sampler_config['pruner']}\n")
+        
+        # Add pruner parameter details
+        pruner_type = sampler_config['pruner']
+        if pruner_type == 'median':
+            self.optim_log_text.insert(tk.END, f"  Median Pruner: startup={sampler_config.get('median_startup_trials', 5)}, warmup={sampler_config.get('median_warmup_steps', 10)}, min_trials={sampler_config.get('median_min_trials', 5)}\n")
+        elif pruner_type == 'percentile':
+            self.optim_log_text.insert(tk.END, f"  Percentile Pruner: percentile={sampler_config.get('percentile', 25.0)}%, startup={sampler_config.get('percentile_startup_trials', 5)}, warmup={sampler_config.get('percentile_warmup_steps', 0)}\n")
+        elif pruner_type == 'successive_halving':
+            self.optim_log_text.insert(tk.END, f"  Successive Halving: min_resource={sampler_config.get('halving_min_resource', 1)}, reduction={sampler_config.get('halving_reduction_factor', 4)}, min_early_stop={sampler_config.get('halving_min_early_stopping_rate', 5)}\n")
+        elif pruner_type == 'none':
+            self.optim_log_text.insert(tk.END, f"  No pruning enabled\n")
+        
+        self.optim_log_text.insert(tk.END, f"Device: {device}\n")
+        
+        # Show which parameters are being optimized
+        params_to_optimize = []
+        if param_config.get('optimize_lr', True): params_to_optimize.append("Learning Rate")
+        if param_config.get('optimize_wd', True): params_to_optimize.append("Weight Decay")
+        if param_config.get('optimize_embd', True): params_to_optimize.append("Embedding Dim")
+        if param_config.get('optimize_layers', True): params_to_optimize.append("Layers")
+        if param_config.get('optimize_heads', True): params_to_optimize.append("Heads")
+        if param_config.get('optimize_dropout', True): params_to_optimize.append("Dropout")
+        if param_config.get('optimize_batch', True): params_to_optimize.append("Batch Size")
+        
+        self.optim_log_text.insert(tk.END, f"Optimizing: {', '.join(params_to_optimize)}\n")
+        self.optim_log_text.insert(tk.END, "=" * 50 + "\n\n")
         self.optim_log_text.config(state="disabled")
 
         self.optim_progress_bar['value'] = 0
@@ -155,29 +194,34 @@ class GPT_GUI:
         self.optim_queue = queue.Queue()
         self.stop_optimization_event = threading.Event()
         
-        thread = threading.Thread(target=self.run_optimization_thread, args=(n_trials, steps_per_trial, arch_config))
+        thread = threading.Thread(target=self.run_optimization_thread, args=(n_trials, steps_per_trial, arch_config, param_config, sampler_config))
         thread.daemon = True
         thread.start()
         
         # Start updating the log display
         self.root.after(100, self.process_optim_queue)
 
-    def run_optimization_thread(self, n_trials, steps_per_trial, arch_config):
+    def run_optimization_thread(self, n_trials, steps_per_trial, arch_config, param_config, sampler_config):
         original_stdout = sys.stdout
         sys.stdout = QueueStream(self.optim_queue)
 
         try:
-            new_config = run_hyperparameter_optimization(arch_config, n_trials, steps_per_trial)
+            new_config = run_hyperparameter_optimization(
+                arch_config, n_trials, steps_per_trial, 
+                param_config, self.stop_optimization_event, sampler_config
+            )
             self.root.after(0, self.on_optimization_complete, new_config)
         except Exception as e:
-            print(f"\n--- OPTIMIZATION FAILED ---\n{e}")
-            self.root.after(0, lambda: self.status_text.set(f"Optimization error: {e}"))
+            error_msg = str(e)
+            print(f"\n--- OPTIMIZATION FAILED ---\n{error_msg}")
+            self.root.after(0, lambda msg=error_msg: self.status_text.set(f"Optimization error: {msg}"))
         finally:
             sys.stdout = original_stdout
             self.root.after(0, self.optimization_finished)
 
     def process_optim_queue(self):
         updated = False
+        trial_completed = False
         try:
             while not self.optim_queue.empty():
                 line = self.optim_queue.get_nowait()
@@ -186,30 +230,67 @@ class GPT_GUI:
                 self.optim_log_text.config(state='disabled')
                 self.optim_log_text.see(tk.END)
                 updated = True
+                
+                # Update progress bar based on trial completion
+                if "Trial #" in line and "completed" in line:
+                    trial_completed = True
+                elif "Trial #" in line and "Starting Trial" in line:
+                    # Extract trial number and update progress
+                    try:
+                        import re
+                        match = re.search(r"Trial #(\d+)", line)
+                        if match:
+                            current_trial = int(match.group(1))
+                            self.optim_progress_bar['value'] = current_trial
+                    except:
+                        pass
         except:
             pass
         
         if updated:
             self.root.update_idletasks()
         
+        # Update progress bar if trial completed
+        if trial_completed:
+            current_value = self.optim_progress_bar['value']
+            if current_value < self.optim_progress_bar['maximum']:
+                self.optim_progress_bar['value'] = current_value + 1
+        
         # Continue processing if optimization is running
         if self.optimize_button['state'] == 'disabled':
             self.root.after(100, self.process_optim_queue)
 
     def stop_optimization(self):
-        if hasattr(self, 'stop_optimization_event'):
+        if hasattr(self, 'stop_optimization_event') and self.stop_optimization_event:
+            print("Stop button clicked - setting stop event")
             self.stop_optimization_event.set()
-        self.stop_optimize_button.config(state="disabled")
-        self.status_text.set("Stopping optimization...")
+            self.stop_optimize_button.config(state="disabled")
+            self.status_text.set("Stopping optimization and saving best parameters...")
+            
+            # Add message to log
+            self.optim_log_text.config(state="normal")
+            self.optim_log_text.insert(tk.END, "\n=== STOP REQUESTED BY USER ===\n")
+            self.optim_log_text.insert(tk.END, "Stopping optimization and saving best parameters found so far...\n")
+            self.optim_log_text.config(state="disabled")
+            self.optim_log_text.see(tk.END)
 
     def optimization_finished(self):
         self.optimize_button.config(state="normal")
         self.stop_optimize_button.config(state="disabled")
         self.train_button.config(state="normal")
         self.generate_button.config(state="normal")
+        
+        if hasattr(self, 'stop_optimization_event') and self.stop_optimization_event and self.stop_optimization_event.is_set():
+            self.status_text.set("Optimization stopped by user. Best parameters saved.")
+        else:
+            self.status_text.set("Optimization completed. Best parameters saved.")
 
     def on_optimization_complete(self, new_config):
-        messagebox.showinfo("Optimization Complete", "Hyperparameter optimization finished. The model has been updated with the best parameters found.")
+        if hasattr(self, 'stop_optimization_event') and self.stop_optimization_event and self.stop_optimization_event.is_set():
+            messagebox.showinfo("Optimization Stopped", "Hyperparameter optimization was stopped by user. The model has been updated with the best parameters found so far.")
+        else:
+            messagebox.showinfo("Optimization Complete", "Hyperparameter optimization finished. The model has been updated with the best parameters found.")
+        
         self.config = new_config
         self.config.vocab_size = vocab_size # Also update vocab size on new config
         
@@ -221,9 +302,42 @@ class GPT_GUI:
         self.query_groups_var.set(str(new_config.n_query_groups))
         self.on_attention_type_change()  # Update query groups combo state
         
+        # Update parameter fixed values with optimized results
+        self.lr_fixed_entry.config(state="normal")
+        self.lr_fixed_entry.delete(0, tk.END)
+        self.lr_fixed_entry.insert(0, str(new_config.learning_rate))
+        
+        self.wd_fixed_entry.config(state="normal")
+        self.wd_fixed_entry.delete(0, tk.END)
+        self.wd_fixed_entry.insert(0, str(new_config.weight_decay))
+        
+        self.embd_fixed_entry.config(state="normal")
+        self.embd_fixed_entry.delete(0, tk.END)
+        self.embd_fixed_entry.insert(0, str(new_config.n_embd))
+        
+        self.layers_fixed_entry.config(state="normal")
+        self.layers_fixed_entry.delete(0, tk.END)
+        self.layers_fixed_entry.insert(0, str(new_config.n_layer))
+        
+        self.heads_fixed_entry.config(state="normal")
+        self.heads_fixed_entry.delete(0, tk.END)
+        self.heads_fixed_entry.insert(0, str(new_config.n_head))
+        
+        self.dropout_fixed_entry.config(state="normal")
+        self.dropout_fixed_entry.delete(0, tk.END)
+        self.dropout_fixed_entry.insert(0, str(new_config.dropout))
+        
+        if hasattr(new_config, 'batch_size'):
+            self.batch_fixed_entry.config(state="normal")
+            self.batch_fixed_entry.delete(0, tk.END)
+            self.batch_fixed_entry.insert(0, str(new_config.batch_size))
+        
+        # Restore parameter toggle states
+        self.on_param_toggle()
+        
         self.trainer = Trainer(self.config, loss_callback=self.queue_loss)
         self.update_hyperparameter_display()  # Update the display with new hyperparameters
-        self.status_text.set("Model updated with new hyperparameters.")
+        self.status_text.set("Model updated with optimized hyperparameters.")
 
     def show_about(self):
         """Show about dialog with version information"""
@@ -329,22 +443,163 @@ https://github.com/DatGuyShorty/DGS-GPT"""
         hyperparam_frame = ttk.Frame(self.notebook, padding="10")
         self.notebook.add(hyperparam_frame, text='Hyperparameter Optimization')
 
-        # Controls frame
-        controls_frame = tk.Frame(hyperparam_frame)
-        controls_frame.pack(fill='x', pady=5)
+        # Create scrollable frame for all controls
+        canvas = tk.Canvas(hyperparam_frame)
+        scrollbar = ttk.Scrollbar(hyperparam_frame, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        # Basic Controls frame
+        basic_frame = tk.LabelFrame(scrollable_frame, text="Basic Settings", padx=10, pady=5)
+        basic_frame.pack(fill='x', pady=5)
         
-        tk.Label(controls_frame, text="Number of Trials:").pack(side='left', padx=5)
-        self.trials_input = tk.Entry(controls_frame, width=10)
+        basic_controls = tk.Frame(basic_frame)
+        basic_controls.pack(fill='x', pady=5)
+        
+        tk.Label(basic_controls, text="Number of Trials:").pack(side='left', padx=5)
+        self.trials_input = tk.Entry(basic_controls, width=10)
         self.trials_input.insert(0, "10")
         self.trials_input.pack(side='left', padx=5)
 
-        tk.Label(controls_frame, text="Steps per Trial:").pack(side='left', padx=5)
-        self.steps_per_trial_input = tk.Entry(controls_frame, width=10)
+        tk.Label(basic_controls, text="Steps per Trial:").pack(side='left', padx=5)
+        self.steps_per_trial_input = tk.Entry(basic_controls, width=10)
         self.steps_per_trial_input.insert(0, "100")
         self.steps_per_trial_input.pack(side='left', padx=5)
 
+        # Parameter Selection frame
+        param_frame = tk.LabelFrame(scrollable_frame, text="Parameters to Optimize", padx=10, pady=5)
+        param_frame.pack(fill='x', pady=5)
+
+        # Learning Rate
+        lr_frame = tk.Frame(param_frame)
+        lr_frame.pack(fill='x', pady=2)
+        self.optimize_lr_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(lr_frame, text="Learning Rate", variable=self.optimize_lr_var, 
+                      command=self.on_param_toggle).pack(side='left', padx=5)
+        tk.Label(lr_frame, text="Min:").pack(side='left', padx=(20,2))
+        self.lr_min_entry = tk.Entry(lr_frame, width=10)
+        self.lr_min_entry.insert(0, "1e-5")
+        self.lr_min_entry.pack(side='left', padx=2)
+        tk.Label(lr_frame, text="Max:").pack(side='left', padx=2)
+        self.lr_max_entry = tk.Entry(lr_frame, width=10)
+        self.lr_max_entry.insert(0, "1e-2")
+        self.lr_max_entry.pack(side='left', padx=2)
+        tk.Label(lr_frame, text="Fixed:").pack(side='left', padx=(10,2))
+        self.lr_fixed_entry = tk.Entry(lr_frame, width=10)
+        self.lr_fixed_entry.insert(0, str(self.config.learning_rate))
+        self.lr_fixed_entry.pack(side='left', padx=2)
+
+        # Weight Decay
+        wd_frame = tk.Frame(param_frame)
+        wd_frame.pack(fill='x', pady=2)
+        self.optimize_wd_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(wd_frame, text="Weight Decay", variable=self.optimize_wd_var, 
+                      command=self.on_param_toggle).pack(side='left', padx=5)
+        tk.Label(wd_frame, text="Min:").pack(side='left', padx=(20,2))
+        self.wd_min_entry = tk.Entry(wd_frame, width=10)
+        self.wd_min_entry.insert(0, "1e-6")
+        self.wd_min_entry.pack(side='left', padx=2)
+        tk.Label(wd_frame, text="Max:").pack(side='left', padx=2)
+        self.wd_max_entry = tk.Entry(wd_frame, width=10)
+        self.wd_max_entry.insert(0, "1e-2")
+        self.wd_max_entry.pack(side='left', padx=2)
+        tk.Label(wd_frame, text="Fixed:").pack(side='left', padx=(10,2))
+        self.wd_fixed_entry = tk.Entry(wd_frame, width=10)
+        self.wd_fixed_entry.insert(0, str(self.config.weight_decay))
+        self.wd_fixed_entry.pack(side='left', padx=2)
+
+        # Embedding Dimension
+        embd_frame = tk.Frame(param_frame)
+        embd_frame.pack(fill='x', pady=2)
+        self.optimize_embd_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(embd_frame, text="Embedding Dim", variable=self.optimize_embd_var, 
+                      command=self.on_param_toggle).pack(side='left', padx=5)
+        tk.Label(embd_frame, text="Choices:").pack(side='left', padx=(20,2))
+        self.embd_choices_entry = tk.Entry(embd_frame, width=15)
+        self.embd_choices_entry.insert(0, "256,512,1024")
+        self.embd_choices_entry.pack(side='left', padx=2)
+        tk.Label(embd_frame, text="Fixed:").pack(side='left', padx=(10,2))
+        self.embd_fixed_entry = tk.Entry(embd_frame, width=10)
+        self.embd_fixed_entry.insert(0, str(self.config.n_embd))
+        self.embd_fixed_entry.pack(side='left', padx=2)
+
+        # Number of Layers
+        layers_frame = tk.Frame(param_frame)
+        layers_frame.pack(fill='x', pady=2)
+        self.optimize_layers_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(layers_frame, text="Layers", variable=self.optimize_layers_var, 
+                      command=self.on_param_toggle).pack(side='left', padx=5)
+        tk.Label(layers_frame, text="Min:").pack(side='left', padx=(20,2))
+        self.layers_min_entry = tk.Entry(layers_frame, width=10)
+        self.layers_min_entry.insert(0, "4")
+        self.layers_min_entry.pack(side='left', padx=2)
+        tk.Label(layers_frame, text="Max:").pack(side='left', padx=2)
+        self.layers_max_entry = tk.Entry(layers_frame, width=10)
+        self.layers_max_entry.insert(0, "16")
+        self.layers_max_entry.pack(side='left', padx=2)
+        tk.Label(layers_frame, text="Fixed:").pack(side='left', padx=(10,2))
+        self.layers_fixed_entry = tk.Entry(layers_frame, width=10)
+        self.layers_fixed_entry.insert(0, str(self.config.n_layer))
+        self.layers_fixed_entry.pack(side='left', padx=2)
+
+        # Number of Heads
+        heads_frame = tk.Frame(param_frame)
+        heads_frame.pack(fill='x', pady=2)
+        self.optimize_heads_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(heads_frame, text="Heads", variable=self.optimize_heads_var, 
+                      command=self.on_param_toggle).pack(side='left', padx=5)
+        tk.Label(heads_frame, text="Choices:").pack(side='left', padx=(20,2))
+        self.heads_choices_entry = tk.Entry(heads_frame, width=15)
+        self.heads_choices_entry.insert(0, "4,8,16")
+        self.heads_choices_entry.pack(side='left', padx=2)
+        tk.Label(heads_frame, text="Fixed:").pack(side='left', padx=(10,2))
+        self.heads_fixed_entry = tk.Entry(heads_frame, width=10)
+        self.heads_fixed_entry.insert(0, str(self.config.n_head))
+        self.heads_fixed_entry.pack(side='left', padx=2)
+
+        # Dropout
+        dropout_frame = tk.Frame(param_frame)
+        dropout_frame.pack(fill='x', pady=2)
+        self.optimize_dropout_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(dropout_frame, text="Dropout", variable=self.optimize_dropout_var, 
+                      command=self.on_param_toggle).pack(side='left', padx=5)
+        tk.Label(dropout_frame, text="Min:").pack(side='left', padx=(20,2))
+        self.dropout_min_entry = tk.Entry(dropout_frame, width=10)
+        self.dropout_min_entry.insert(0, "0.0")
+        self.dropout_min_entry.pack(side='left', padx=2)
+        tk.Label(dropout_frame, text="Max:").pack(side='left', padx=2)
+        self.dropout_max_entry = tk.Entry(dropout_frame, width=10)
+        self.dropout_max_entry.insert(0, "0.5")
+        self.dropout_max_entry.pack(side='left', padx=2)
+        tk.Label(dropout_frame, text="Fixed:").pack(side='left', padx=(10,2))
+        self.dropout_fixed_entry = tk.Entry(dropout_frame, width=10)
+        self.dropout_fixed_entry.insert(0, str(self.config.dropout))
+        self.dropout_fixed_entry.pack(side='left', padx=2)
+
+        # Batch Size
+        batch_frame = tk.Frame(param_frame)
+        batch_frame.pack(fill='x', pady=2)
+        self.optimize_batch_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(batch_frame, text="Batch Size", variable=self.optimize_batch_var, 
+                      command=self.on_param_toggle).pack(side='left', padx=5)
+        tk.Label(batch_frame, text="Choices:").pack(side='left', padx=(20,2))
+        self.batch_choices_entry = tk.Entry(batch_frame, width=15)
+        self.batch_choices_entry.insert(0, "8,16,24,32")
+        self.batch_choices_entry.pack(side='left', padx=2)
+        tk.Label(batch_frame, text="Fixed:").pack(side='left', padx=(10,2))
+        self.batch_fixed_entry = tk.Entry(batch_frame, width=10)
+        self.batch_fixed_entry.insert(0, str(self.config.batch_size))
+        self.batch_fixed_entry.pack(side='left', padx=2)
+
         # Architecture settings frame
-        arch_frame = tk.LabelFrame(hyperparam_frame, text="Architecture Settings", padx=10, pady=5)
+        arch_frame = tk.LabelFrame(scrollable_frame, text="Architecture Settings", padx=10, pady=5)
         arch_frame.pack(fill='x', pady=5)
 
         # MoE settings
@@ -374,9 +629,9 @@ https://github.com/DatGuyShorty/DGS-GPT"""
         tk.Label(attn_frame, text="Attention Type:").pack(side='left', padx=5)
         self.attention_type_var = tk.StringVar(value=self.config.attention_type)
         attn_combo = ttk.Combobox(attn_frame, textvariable=self.attention_type_var, 
-                                 values=["multihead", "grouped_query"], width=15, state="readonly",
-                                 command=self.on_attention_type_change)
+                                 values=["multihead", "grouped_query"], width=15, state="readonly")
         attn_combo.pack(side='left', padx=5)
+        attn_combo.bind('<<ComboboxSelected>>', self.on_attention_type_change)
         
         tk.Label(attn_frame, text="Query Groups:").pack(side='left', padx=(20,5))
         self.query_groups_var = tk.StringVar(value=str(self.config.n_query_groups))
@@ -387,9 +642,133 @@ https://github.com/DatGuyShorty/DGS-GPT"""
         # Update query groups based on initial attention type
         self.on_attention_type_change()
 
-        # Controls frame (moved after architecture settings)
-        controls_frame = tk.Frame(hyperparam_frame)
-        controls_frame.pack(fill='x', pady=5)
+        # Sampler Settings frame
+        sampler_frame = tk.LabelFrame(scrollable_frame, text="Sampler & Pruner Settings", padx=10, pady=5)
+        sampler_frame.pack(fill='x', pady=5)
+
+        sampler_controls = tk.Frame(sampler_frame)
+        sampler_controls.pack(fill='x', pady=2)
+        
+        tk.Label(sampler_controls, text="Sampler:").pack(side='left', padx=5)
+        self.sampler_var = tk.StringVar(value="tpe")
+        sampler_combo = ttk.Combobox(sampler_controls, textvariable=self.sampler_var, 
+                                    values=["tpe", "random", "grid", "cmaes"], width=10, state="readonly")
+        sampler_combo.pack(side='left', padx=5)
+        
+        tk.Label(sampler_controls, text="Pruner:").pack(side='left', padx=(20,5))
+        self.pruner_var = tk.StringVar(value="median")
+        pruner_combo = ttk.Combobox(sampler_controls, textvariable=self.pruner_var, 
+                                   values=["median", "percentile", "successive_halving", "none"], width=15, state="readonly")
+        pruner_combo.pack(side='left', padx=5)
+
+        sampler_params = tk.Frame(sampler_frame)
+        sampler_params.pack(fill='x', pady=2)
+        
+        tk.Label(sampler_params, text="Startup Trials:").pack(side='left', padx=5)
+        self.startup_trials_entry = tk.Entry(sampler_params, width=8)
+        self.startup_trials_entry.insert(0, "10")
+        self.startup_trials_entry.pack(side='left', padx=5)
+        
+        tk.Label(sampler_params, text="Seed:").pack(side='left', padx=(20,5))
+        self.seed_entry = tk.Entry(sampler_params, width=10)
+        self.seed_entry.insert(0, "")
+        self.seed_entry.pack(side='left', padx=5)
+        
+        self.multivariate_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(sampler_params, text="Multivariate", variable=self.multivariate_var).pack(side='left', padx=20)
+
+        # Pruner parameters frame
+        pruner_params = tk.Frame(sampler_frame)
+        pruner_params.pack(fill='x', pady=2)
+        
+        # Add help text for pruner parameters
+        help_label = tk.Label(pruner_params, text="Pruner Parameters:", font=("Arial", 9, "bold"))
+        help_label.pack(anchor='w', padx=5, pady=(5,2))
+        
+        # Median Pruner parameters
+        median_frame = tk.Frame(pruner_params)
+        median_frame.pack(fill='x', pady=2)
+        tk.Label(median_frame, text="Median Pruner:", fg="blue").pack(side='left', padx=5)
+        
+        tk.Label(median_frame, text="Startup Trials:").pack(side='left', padx=(10,2))
+        self.median_startup_entry = tk.Entry(median_frame, width=6)
+        self.median_startup_entry.insert(0, "5")
+        self.median_startup_entry.pack(side='left', padx=2)
+        
+        tk.Label(median_frame, text="Warmup Steps:").pack(side='left', padx=(10,2))
+        self.median_warmup_entry = tk.Entry(median_frame, width=6)
+        self.median_warmup_entry.insert(0, "10")
+        self.median_warmup_entry.pack(side='left', padx=2)
+        
+        tk.Label(median_frame, text="Min Trials:").pack(side='left', padx=(10,2))
+        self.median_min_trials_entry = tk.Entry(median_frame, width=6)
+        self.median_min_trials_entry.insert(0, "5")
+        self.median_min_trials_entry.pack(side='left', padx=2)
+        
+        # Add tooltip info
+        median_info = tk.Label(median_frame, text="ℹ", fg="gray", cursor="hand2")
+        median_info.pack(side='left', padx=5)
+        
+        # Percentile Pruner parameters
+        percentile_frame = tk.Frame(pruner_params)
+        percentile_frame.pack(fill='x', pady=2)
+        tk.Label(percentile_frame, text="Percentile Pruner:", fg="green").pack(side='left', padx=5)
+        
+        tk.Label(percentile_frame, text="Percentile:").pack(side='left', padx=(10,2))
+        self.percentile_entry = tk.Entry(percentile_frame, width=8)
+        self.percentile_entry.insert(0, "25.0")
+        self.percentile_entry.pack(side='left', padx=2)
+        
+        tk.Label(percentile_frame, text="Startup Trials:").pack(side='left', padx=(10,2))
+        self.percentile_startup_entry = tk.Entry(percentile_frame, width=6)
+        self.percentile_startup_entry.insert(0, "5")
+        self.percentile_startup_entry.pack(side='left', padx=2)
+        
+        tk.Label(percentile_frame, text="Warmup Steps:").pack(side='left', padx=(10,2))
+        self.percentile_warmup_entry = tk.Entry(percentile_frame, width=6)
+        self.percentile_warmup_entry.insert(0, "0")
+        self.percentile_warmup_entry.pack(side='left', padx=2)
+        
+        percentile_info = tk.Label(percentile_frame, text="ℹ", fg="gray", cursor="hand2")
+        percentile_info.pack(side='left', padx=5)
+        
+        # Successive Halving Pruner parameters
+        halving_frame = tk.Frame(pruner_params)
+        halving_frame.pack(fill='x', pady=2)
+        tk.Label(halving_frame, text="Successive Halving:", fg="red").pack(side='left', padx=5)
+        
+        tk.Label(halving_frame, text="Min Resource:").pack(side='left', padx=(10,2))
+        self.halving_min_resource_entry = tk.Entry(halving_frame, width=6)
+        self.halving_min_resource_entry.insert(0, "1")
+        self.halving_min_resource_entry.pack(side='left', padx=2)
+        
+        tk.Label(halving_frame, text="Reduction Factor:").pack(side='left', padx=(10,2))
+        self.halving_reduction_entry = tk.Entry(halving_frame, width=6)
+        self.halving_reduction_entry.insert(0, "4")
+        self.halving_reduction_entry.pack(side='left', padx=2)
+        
+        tk.Label(halving_frame, text="Min Early Stop:").pack(side='left', padx=(10,2))
+        self.halving_min_early_stop_entry = tk.Entry(halving_frame, width=6)
+        self.halving_min_early_stop_entry.insert(0, "5")
+        self.halving_min_early_stop_entry.pack(side='left', padx=2)
+        
+        halving_info = tk.Label(halving_frame, text="ℹ", fg="gray", cursor="hand2")
+        halving_info.pack(side='left', padx=5)
+        
+        # Pruner description frame
+        desc_frame = tk.Frame(pruner_params)
+        desc_frame.pack(fill='x', pady=(5,0))
+        pruner_desc = tk.Text(desc_frame, height=3, font=("Arial", 8), bg="#f0f0f0", wrap=tk.WORD)
+        pruner_desc.pack(fill='x', padx=5)
+        pruner_desc.insert("1.0", 
+            "• Median: Prunes trials below median performance after warmup steps\n"
+            "• Percentile: Prunes trials below specified percentile threshold\n"
+            "• Successive Halving: Resource-efficient pruning with successive reductions")
+        pruner_desc.config(state="disabled")
+
+        # Controls frame
+        controls_frame = tk.Frame(scrollable_frame)
+        controls_frame.pack(fill='x', pady=10)
         
         self.optimize_button = tk.Button(controls_frame, text="Start Optimization", command=self.start_optimization_thread)
         self.optimize_button.pack(side='left', padx=5)
@@ -398,13 +777,20 @@ https://github.com/DatGuyShorty/DGS-GPT"""
         self.stop_optimize_button.pack(side='left', padx=5)
 
         # Progress bar for optimization
-        self.optim_progress_bar = ttk.Progressbar(hyperparam_frame, orient='horizontal', mode='determinate')
+        self.optim_progress_bar = ttk.Progressbar(scrollable_frame, orient='horizontal', mode='determinate')
         self.optim_progress_bar.pack(fill='x', pady=5)
 
         # Log display
-        tk.Label(hyperparam_frame, text="Optimization Log:").pack(pady=(10,5), anchor="w")
-        self.optim_log_text = scrolledtext.ScrolledText(hyperparam_frame, height=20, wrap=tk.WORD, state="disabled")
+        tk.Label(scrollable_frame, text="Optimization Log:").pack(pady=(10,5), anchor="w")
+        self.optim_log_text = scrolledtext.ScrolledText(scrollable_frame, height=15, wrap=tk.WORD, state="disabled")
         self.optim_log_text.pack(fill="both", expand=True, pady=5)
+
+        # Pack canvas and scrollbar
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        # Initialize parameter states
+        self.on_param_toggle()
 
     def on_moe_toggle(self):
         """Handle MoE checkbox toggle"""
@@ -421,6 +807,153 @@ https://github.com/DatGuyShorty/DGS-GPT"""
             # Disable query groups combo for multihead attention
             self.query_groups_combo.config(state="disabled")
             self.query_groups_var.set("1")  # Reset to 1 for multihead
+
+    def on_param_toggle(self):
+        """Handle parameter optimization toggle"""
+        # Enable/disable parameter entry fields based on checkbox states
+        params = [
+            (self.optimize_lr_var, [self.lr_min_entry, self.lr_max_entry], [self.lr_fixed_entry]),
+            (self.optimize_wd_var, [self.wd_min_entry, self.wd_max_entry], [self.wd_fixed_entry]),
+            (self.optimize_embd_var, [self.embd_choices_entry], [self.embd_fixed_entry]),
+            (self.optimize_layers_var, [self.layers_min_entry, self.layers_max_entry], [self.layers_fixed_entry]),
+            (self.optimize_heads_var, [self.heads_choices_entry], [self.heads_fixed_entry]),
+            (self.optimize_dropout_var, [self.dropout_min_entry, self.dropout_max_entry], [self.dropout_fixed_entry]),
+            (self.optimize_batch_var, [self.batch_choices_entry], [self.batch_fixed_entry])
+        ]
+        
+        for var, optimize_entries, fixed_entries in params:
+            if var.get():
+                # Enable optimization entries, disable fixed
+                for entry in optimize_entries:
+                    entry.config(state="normal")
+                for entry in fixed_entries:
+                    entry.config(state="disabled")
+            else:
+                # Disable optimization entries, enable fixed
+                for entry in optimize_entries:
+                    entry.config(state="disabled")
+                for entry in fixed_entries:
+                    entry.config(state="normal")
+
+    def get_parameter_config(self):
+        """Get parameter configuration from GUI controls"""
+        param_config = {}
+        
+        try:
+            # Learning Rate
+            param_config['optimize_lr'] = self.optimize_lr_var.get()
+            if param_config['optimize_lr']:
+                param_config['lr_min'] = float(self.lr_min_entry.get())
+                param_config['lr_max'] = float(self.lr_max_entry.get())
+            else:
+                param_config['lr_value'] = float(self.lr_fixed_entry.get())
+            
+            # Weight Decay
+            param_config['optimize_wd'] = self.optimize_wd_var.get()
+            if param_config['optimize_wd']:
+                param_config['wd_min'] = float(self.wd_min_entry.get())
+                param_config['wd_max'] = float(self.wd_max_entry.get())
+            else:
+                param_config['wd_value'] = float(self.wd_fixed_entry.get())
+            
+            # Embedding Dimension
+            param_config['optimize_embd'] = self.optimize_embd_var.get()
+            if param_config['optimize_embd']:
+                choices_str = self.embd_choices_entry.get()
+                param_config['embd_choices'] = [int(x.strip()) for x in choices_str.split(',')]
+            else:
+                param_config['embd_value'] = int(self.embd_fixed_entry.get())
+            
+            # Layers
+            param_config['optimize_layers'] = self.optimize_layers_var.get()
+            if param_config['optimize_layers']:
+                param_config['layer_min'] = int(self.layers_min_entry.get())
+                param_config['layer_max'] = int(self.layers_max_entry.get())
+            else:
+                param_config['layer_value'] = int(self.layers_fixed_entry.get())
+            
+            # Heads
+            param_config['optimize_heads'] = self.optimize_heads_var.get()
+            if param_config['optimize_heads']:
+                choices_str = self.heads_choices_entry.get()
+                param_config['head_choices'] = [int(x.strip()) for x in choices_str.split(',')]
+            else:
+                param_config['head_value'] = int(self.heads_fixed_entry.get())
+            
+            # Dropout
+            param_config['optimize_dropout'] = self.optimize_dropout_var.get()
+            if param_config['optimize_dropout']:
+                param_config['dropout_min'] = float(self.dropout_min_entry.get())
+                param_config['dropout_max'] = float(self.dropout_max_entry.get())
+            else:
+                param_config['dropout_value'] = float(self.dropout_fixed_entry.get())
+            
+            # Batch Size
+            param_config['optimize_batch'] = self.optimize_batch_var.get()
+            if param_config['optimize_batch']:
+                choices_str = self.batch_choices_entry.get()
+                param_config['batch_choices'] = [int(x.strip()) for x in choices_str.split(',')]
+            else:
+                param_config['batch_value'] = int(self.batch_fixed_entry.get())
+            
+        except ValueError as e:
+            messagebox.showerror("Invalid Input", f"Invalid parameter value: {e}")
+            return None
+        
+        return param_config
+
+    def get_sampler_config(self):
+        """Get sampler configuration from GUI controls"""
+        sampler_config = {}
+        
+        sampler_config['type'] = self.sampler_var.get()
+        sampler_config['pruner'] = self.pruner_var.get()
+        
+        try:
+            sampler_config['n_startup_trials'] = int(self.startup_trials_entry.get())
+        except:
+            sampler_config['n_startup_trials'] = 10
+        
+        seed_text = self.seed_entry.get().strip()
+        if seed_text:
+            try:
+                sampler_config['seed'] = int(seed_text)
+            except:
+                sampler_config['seed'] = None
+        else:
+            sampler_config['seed'] = None
+        
+        sampler_config['multivariate'] = self.multivariate_var.get()
+        
+        # Add pruner-specific parameters
+        try:
+            # Median Pruner parameters
+            sampler_config['median_startup_trials'] = int(self.median_startup_entry.get())
+            sampler_config['median_warmup_steps'] = int(self.median_warmup_entry.get())
+            sampler_config['median_min_trials'] = int(self.median_min_trials_entry.get())
+            
+            # Percentile Pruner parameters
+            sampler_config['percentile'] = float(self.percentile_entry.get())
+            sampler_config['percentile_startup_trials'] = int(self.percentile_startup_entry.get())
+            sampler_config['percentile_warmup_steps'] = int(self.percentile_warmup_entry.get())
+            
+            # Successive Halving Pruner parameters
+            sampler_config['halving_min_resource'] = int(self.halving_min_resource_entry.get())
+            sampler_config['halving_reduction_factor'] = int(self.halving_reduction_entry.get())
+            sampler_config['halving_min_early_stopping_rate'] = int(self.halving_min_early_stop_entry.get())
+        except ValueError:
+            # Use defaults if invalid values entered
+            sampler_config['median_startup_trials'] = 5
+            sampler_config['median_warmup_steps'] = 10
+            sampler_config['median_min_trials'] = 5
+            sampler_config['percentile'] = 25.0
+            sampler_config['percentile_startup_trials'] = 5
+            sampler_config['percentile_warmup_steps'] = 0
+            sampler_config['halving_min_resource'] = 1
+            sampler_config['halving_reduction_factor'] = 4
+            sampler_config['halving_min_early_stopping_rate'] = 5
+        
+        return sampler_config
 
     def get_architecture_config(self):
         """Get architecture configuration from GUI controls"""

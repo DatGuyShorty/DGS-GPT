@@ -10,10 +10,10 @@ try:
     
     # Create GUI instance
     app = GPT_GUI(root)
-    print("✅ GUI instance created")
+    print("✅ GUI instance created successfully")
     
     # Check for new attributes
-    attrs_to_check = ['use_moe_var', 'moe_experts_var', 'attention_type_var']
+    attrs_to_check = ['use_moe_var', 'moe_experts_var', 'attention_type_var', 'query_groups_var']
     for attr in attrs_to_check:
         if hasattr(app, attr):
             print(f"✅ Found attribute: {attr}")
@@ -24,14 +24,16 @@ try:
     try:
         config = app.get_architecture_config()
         print(f"✅ Architecture config created: use_moe={config.use_moe}")
+        print(f"✅ Architecture config: attention_type={config.attention_type}")
     except Exception as e:
         print(f"❌ Error getting architecture config: {e}")
     
     print("✅ All basic tests passed!")
-    print("GUI window will appear - close it to complete the test.")
+    print("Closing test window...")
     
-    # Show the window briefly
-    root.mainloop()
+    # Don't show the window, just test creation
+    root.destroy()
+    print("🎉 GUI test completed successfully!")
     
 except Exception as e:
     print(f"❌ Error: {e}")

@@ -18,23 +18,23 @@ print(f"Using device: {device}")
 @dataclass
 class Config:
     # Model params
-    block_size: int = 256
+    block_size: int = 512 # context window size
     vocab_size: int = 50304 # set in main
-    n_layer: int = 16
-    n_head: int = 16
-    n_embd: int = 1024
-    dropout: float = 0.01
-    use_moe: bool = False
-    moe_num_experts: int = 4
-    moe_k: int = 1
-    attention_type: str = "multihead"
-    n_query_groups: int = 1
+    n_layer: int = 16 # number of transformer blocks
+    n_head: int = 16 # number of attention heads
+    n_embd: int = 1024 # embedding dimension
+    dropout: float = 0.01 # 0.01% dropout
+    use_moe: bool = True # Mixture of Experts
+    moe_num_experts: int = 4  # number of experts
+    moe_k: int = 1  # top-k experts
+    attention_type: str = "grouped_query"   # "multihead" or "grouped_query"
+    n_query_groups: int = 1  # number of query groups
 
     # Training params
-    learning_rate: float = 5e-4
-    weight_decay: float = 1e-5
-    batch_size: int = 24
-    max_iters: int = 1000
+    learning_rate: float = 5e-4 # learning rate
+    weight_decay: float = 1e-5 # weight decay
+    batch_size: int = 2 # batch size
+    max_iters: int = 1000 # maximum training iterations
 
 def load_config(filepath="best_hyperparams.json"):
     default_config = Config()
@@ -305,30 +305,108 @@ class Trainer:
             return False
 
 # Hyperparameter optimization using Optuna
-def objective(trial, steps_per_trial, base_config):
-    # Suggest hyperparameters
+def objective(trial, steps_per_trial, base_config, param_config=None, stop_event=None):
+    # Check if optimization should stop
+    if stop_event and stop_event.is_set():
+        raise optuna.exceptions.TrialPruned()
+    
+    print(f"\n--- Starting Trial #{trial.number} ---")
+    
+    # Suggest hyperparameters based on parameter configuration
     trial_config = Config()
-    trial_config.learning_rate = trial.suggest_float('learning_rate', 1e-5, 1e-2, log=True)
-    trial_config.weight_decay = trial.suggest_float('weight_decay', 1e-6, 1e-2, log=True)
     
-    # Constrain layer and embedding size to prevent VRAM overflow
-    trial_config.n_embd = trial.suggest_categorical('n_embd', [256, 512, 1024])
-    if trial_config.n_embd >= 1024:
-        trial_config.n_layer = trial.suggest_int('n_layer', 4, 8)
-    elif trial_config.n_embd >= 512:
-        trial_config.n_layer = trial.suggest_int('n_layer', 6, 12)
-    else: # 256
-        trial_config.n_layer = trial.suggest_int('n_layer', 8, 16)
-
-    trial_config.n_head = trial.suggest_categorical('n_head', [4, 8, 16])
-    trial_config.dropout = trial.suggest_float('dropout', 0.05, 0.3)
+    # Copy base configuration
+    for attr in dir(base_config):
+        if not attr.startswith('_') and hasattr(trial_config, attr):
+            setattr(trial_config, attr, getattr(base_config, attr))
     
-    # Use fixed architectural choices from base_config instead of optimizing them
-    trial_config.use_moe = base_config.use_moe
-    trial_config.moe_num_experts = base_config.moe_num_experts
-    trial_config.moe_k = base_config.moe_k
-    trial_config.attention_type = base_config.attention_type
-    trial_config.n_query_groups = base_config.n_query_groups
+    if param_config:
+        # Learning Rate
+        if param_config.get('optimize_lr', True):
+            lr_min = param_config.get('lr_min', 1e-5)
+            lr_max = param_config.get('lr_max', 1e-2)
+            trial_config.learning_rate = trial.suggest_float('learning_rate', lr_min, lr_max, log=True)
+        else:
+            trial_config.learning_rate = param_config.get('lr_value', base_config.learning_rate)
+        
+        # Weight Decay
+        if param_config.get('optimize_wd', True):
+            wd_min = param_config.get('wd_min', 1e-6)
+            wd_max = param_config.get('wd_max', 1e-2)
+            trial_config.weight_decay = trial.suggest_float('weight_decay', wd_min, wd_max, log=True)
+        else:
+            trial_config.weight_decay = param_config.get('wd_value', base_config.weight_decay)
+        
+        # Embedding Dimension
+        if param_config.get('optimize_embd', True):
+            embd_choices = param_config.get('embd_choices', [256, 512, 1024])
+            trial_config.n_embd = trial.suggest_categorical('n_embd', embd_choices)
+        else:
+            trial_config.n_embd = param_config.get('embd_value', base_config.n_embd)
+        
+        # Number of Layers
+        if param_config.get('optimize_layers', True):
+            layer_min = param_config.get('layer_min', 4)
+            layer_max = param_config.get('layer_max', 16)
+            # Constrain based on embedding size if being optimized
+            if param_config.get('optimize_embd', True):
+                if trial_config.n_embd >= 1024:
+                    layer_max = min(layer_max, 8)
+                elif trial_config.n_embd >= 512:
+                    layer_max = min(layer_max, 12)
+            trial_config.n_layer = trial.suggest_int('n_layer', layer_min, layer_max)
+        else:
+            trial_config.n_layer = param_config.get('layer_value', base_config.n_layer)
+        
+        # Number of Heads
+        if param_config.get('optimize_heads', True):
+            head_choices = param_config.get('head_choices', [4, 8, 16])
+            trial_config.n_head = trial.suggest_categorical('n_head', head_choices)
+        else:
+            trial_config.n_head = param_config.get('head_value', base_config.n_head)
+        
+        # Dropout
+        if param_config.get('optimize_dropout', True):
+            dropout_min = param_config.get('dropout_min', 0.0)
+            dropout_max = param_config.get('dropout_max', 0.5)
+            trial_config.dropout = trial.suggest_float('dropout', dropout_min, dropout_max)
+        else:
+            trial_config.dropout = param_config.get('dropout_value', base_config.dropout)
+        
+        # Batch Size
+        if param_config.get('optimize_batch', True):
+            batch_choices = param_config.get('batch_choices', [8, 16, 24, 32])
+            trial_config.batch_size = trial.suggest_categorical('batch_size', batch_choices)
+        else:
+            trial_config.batch_size = param_config.get('batch_value', base_config.batch_size)
+    else:
+        # Fallback to original behavior
+        trial_config.learning_rate = trial.suggest_float('learning_rate', 1e-5, 1e-2, log=True)
+        trial_config.weight_decay = trial.suggest_float('weight_decay', 1e-6, 1e-2, log=True)
+        trial_config.n_embd = trial.suggest_categorical('n_embd', [256, 512, 1024])
+        if trial_config.n_embd >= 1024:
+            trial_config.n_layer = trial.suggest_int('n_layer', 4, 8)
+        elif trial_config.n_embd >= 512:
+            trial_config.n_layer = trial.suggest_int('n_layer', 6, 12)
+        else:
+            trial_config.n_layer = trial.suggest_int('n_layer', 8, 16)
+        trial_config.n_head = trial.suggest_categorical('n_head', [4, 8, 16])
+        trial_config.dropout = trial.suggest_float('dropout', 0.05, 0.3)
+    
+    # Print trial configuration
+    print(f"Trial Parameters:")
+    print(f"  Learning Rate: {trial_config.learning_rate:.6f}")
+    print(f"  Weight Decay: {trial_config.weight_decay:.6f}")
+    print(f"  Embedding Dim: {trial_config.n_embd}")
+    print(f"  Layers: {trial_config.n_layer}")
+    print(f"  Heads: {trial_config.n_head}")
+    print(f"  Dropout: {trial_config.dropout:.3f}")
+    print(f"  Batch Size: {trial_config.batch_size}")
+    print(f"  Architecture: {trial_config.attention_type}")
+    if trial_config.use_moe:
+        print(f"  MoE: {trial_config.moe_num_experts} experts, top-{trial_config.moe_k}")
+    if trial_config.attention_type == 'grouped_query':
+        print(f"  Query Groups: {trial_config.n_query_groups}")
     
     # Validate n_query_groups for grouped query attention
     if trial_config.attention_type == 'grouped_query':
@@ -342,13 +420,27 @@ def objective(trial, steps_per_trial, base_config):
 
     trial_config.vocab_size = len(chars)
 
+    # Calculate model parameters
     model = GPTLanguageModel(trial_config).to(device)
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model created: {total_params:,} total params, {trainable_params:,} trainable")
+    
     optimizer = optim.AdamW(model.parameters(), lr=trial_config.learning_rate, weight_decay=trial_config.weight_decay)
     scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
 
     # Training loop (short for optimization)
     loss = torch.tensor(float('inf')) # Default loss
+    best_loss = float('inf')
+    loss_history = []
+    
+    print(f"Starting training for {steps_per_trial} steps...")
     for it in range(steps_per_trial):
+        # Check for stop event
+        if stop_event and stop_event.is_set():
+            print(f"Trial #{trial.number} stopped by user at step {it}")
+            break
+            
         xb, yb = get_batch(trial_config)
         optimizer.zero_grad()
         try:
@@ -371,11 +463,25 @@ def objective(trial, steps_per_trial, base_config):
             gc.collect()
             return float("inf") # Prune trial
 
-        trial.report(loss.item(), it)
+        current_loss = loss.item()
+        loss_history.append(current_loss)
+        
+        if current_loss < best_loss:
+            best_loss = current_loss
+        
+        # Progress reporting every 10 steps or at key milestones
+        if it % 10 == 0 or it == steps_per_trial - 1:
+            avg_loss = sum(loss_history[-10:]) / min(10, len(loss_history))
+            print(f"  Step {it:3d}/{steps_per_trial}: Loss = {current_loss:.6f}, Avg(10) = {avg_loss:.6f}, Best = {best_loss:.6f}")
+
+        trial.report(current_loss, it)
         if trial.should_prune():
+            print(f"Trial #{trial.number} pruned at step {it} (loss: {current_loss:.6f})")
             raise optuna.exceptions.TrialPruned()
 
     final_loss = loss.item()
+    print(f"Trial #{trial.number} completed - Final loss: {final_loss:.6f}, Best loss: {best_loss:.6f}")
+    
     # Explicitly clean up memory
     del model, optimizer, scaler, loss, xb, yb
     if device.type == "cuda":
@@ -383,25 +489,155 @@ def objective(trial, steps_per_trial, base_config):
     gc.collect()
     return final_loss
 
-def run_hyperparameter_optimization(config: Config, n_trials: int, steps_per_trial: int):
-    print("Running hyperparameter optimization...")
+def run_hyperparameter_optimization(config: Config, n_trials: int, steps_per_trial: int, param_config=None, stop_event=None, sampler_config=None):
+    print("=" * 60)
+    print("HYPERPARAMETER OPTIMIZATION STARTING")
+    print("=" * 60)
+    print(f"Configuration:")
+    print(f"  Trials: {n_trials}")
+    print(f"  Steps per trial: {steps_per_trial}")
+    print(f"  Architecture: {config.attention_type}")
+    if config.use_moe:
+        print(f"  MoE: {config.moe_num_experts} experts, top-{config.moe_k}")
+    print(f"  Device: {device}")
+    
+    if param_config:
+        print(f"Parameter Optimization:")
+        params_to_optimize = []
+        if param_config.get('optimize_lr', True): params_to_optimize.append("Learning Rate")
+        if param_config.get('optimize_wd', True): params_to_optimize.append("Weight Decay")
+        if param_config.get('optimize_embd', True): params_to_optimize.append("Embedding Dim")
+        if param_config.get('optimize_layers', True): params_to_optimize.append("Layers")
+        if param_config.get('optimize_heads', True): params_to_optimize.append("Heads")
+        if param_config.get('optimize_dropout', True): params_to_optimize.append("Dropout")
+        if param_config.get('optimize_batch', True): params_to_optimize.append("Batch Size")
+        print(f"  Optimizing: {', '.join(params_to_optimize)}")
+    
+    print("=" * 60)
+
+    # Create sampler based on configuration
+    sampler = None
+    if sampler_config:
+        sampler_type = sampler_config.get('type', 'tpe')
+        if sampler_type == 'tpe':
+            sampler = optuna.samplers.TPESampler(
+                n_startup_trials=sampler_config.get('n_startup_trials', 10),
+                n_ei_candidates=sampler_config.get('n_ei_candidates', 24),
+                seed=sampler_config.get('seed', None),
+                multivariate=sampler_config.get('multivariate', True)
+            )
+        elif sampler_type == 'random':
+            sampler = optuna.samplers.RandomSampler(seed=sampler_config.get('seed', None))
+        elif sampler_type == 'grid':
+            sampler = optuna.samplers.GridSampler()
+        elif sampler_type == 'cmaes':
+            sampler = optuna.samplers.CmaEsSampler(seed=sampler_config.get('seed', None))
+    else:
+        sampler = optuna.samplers.TPESampler(multivariate=True)
+
+    # Create pruner based on configuration
+    pruner_type = sampler_config.get('pruner', 'median') if sampler_config else 'median'
+    if pruner_type == 'median':
+        median_startup = sampler_config.get('median_startup_trials', 5) if sampler_config else 5
+        median_warmup = sampler_config.get('median_warmup_steps', 10) if sampler_config else 10
+        median_min_trials = sampler_config.get('median_min_trials', 5) if sampler_config else 5
+        pruner = optuna.pruners.MedianPruner(
+            n_startup_trials=median_startup, 
+            n_warmup_steps=median_warmup, 
+            n_min_trials=median_min_trials
+        )
+    elif pruner_type == 'percentile':
+        percentile = sampler_config.get('percentile', 25.0) if sampler_config else 25.0
+        percentile_startup = sampler_config.get('percentile_startup_trials', 5) if sampler_config else 5
+        percentile_warmup = sampler_config.get('percentile_warmup_steps', 0) if sampler_config else 0
+        pruner = optuna.pruners.PercentilePruner(
+            percentile=percentile,
+            n_startup_trials=percentile_startup,
+            n_warmup_steps=percentile_warmup
+        )
+    elif pruner_type == 'successive_halving':
+        min_resource = sampler_config.get('halving_min_resource', 1) if sampler_config else 1
+        reduction_factor = sampler_config.get('halving_reduction_factor', 4) if sampler_config else 4
+        min_early_stopping = sampler_config.get('halving_min_early_stopping_rate', 5) if sampler_config else 5
+        pruner = optuna.pruners.SuccessiveHalvingPruner(
+            min_resource=min_resource,
+            reduction_factor=reduction_factor,
+            min_early_stopping_rate=min_early_stopping
+        )
+    else:
+        pruner = optuna.pruners.NopPruner()
 
     study = optuna.create_study(
         direction="minimize",
-        pruner=optuna.pruners.MedianPruner(),
+        pruner=pruner,
+        sampler=sampler,
         storage="sqlite:///optuna_study.db",
         study_name="gpt-optimization-v2",
         load_if_exists=True
     )
-    study.optimize(lambda trial: objective(trial, steps_per_trial, config), n_trials=n_trials, show_progress_bar=True)
     
-    print("Best hyperparameters:", study.best_params)
+    print(f"Study created with {type(sampler).__name__ if sampler else 'default'} sampler and {type(pruner).__name__} pruner")
+    
+    # Log pruner parameters
+    if pruner_type == 'median':
+        print(f"  Median Pruner settings: startup_trials={median_startup}, warmup_steps={median_warmup}, min_trials={median_min_trials}")
+    elif pruner_type == 'percentile':
+        print(f"  Percentile Pruner settings: percentile={percentile}%, startup_trials={percentile_startup}, warmup_steps={percentile_warmup}")
+    elif pruner_type == 'successive_halving':
+        print(f"  Successive Halving Pruner settings: min_resource={min_resource}, reduction_factor={reduction_factor}, min_early_stopping={min_early_stopping}")
+    elif pruner_type == 'none':
+        print(f"  No pruning enabled")
+    
+    print(f"Starting optimization...")
+    
+    def verbose_callback(study, trial):
+        if stop_event and stop_event.is_set():
+            print(f"\n--- Optimization stopped by user ---")
+            return
+            
+        print(f"\n--- Trial #{trial.number} Summary ---")
+        if trial.state == optuna.trial.TrialState.COMPLETE:
+            print(f"Status: COMPLETED")
+            print(f"Final Value: {trial.value:.6f}")
+        elif trial.state == optuna.trial.TrialState.PRUNED:
+            print(f"Status: PRUNED")
+        else:
+            print(f"Status: {trial.state}")
+        
+        if len(study.trials) > 0:
+            best_trial = study.best_trial
+            print(f"Current Best Trial: #{best_trial.number} (Value: {best_trial.value:.6f})")
+        print("-" * 40)
+    
     try:
-        with open("best_hyperparams.json", "w") as f:
-            json.dump(study.best_params, f, indent=4)
-        print("Best hyperparameters saved to best_hyperparams.json")
-    except Exception as e:
-        print(f"Error saving best_hyperparams.json: {e}")
+        study.optimize(
+            lambda trial: objective(trial, steps_per_trial, config, param_config, stop_event), 
+            n_trials=n_trials, 
+            show_progress_bar=True,
+            callbacks=[verbose_callback]
+        )
+    except KeyboardInterrupt:
+        print("\nOptimization interrupted by user")
+    
+    print("\n" + "=" * 60)
+    if stop_event and stop_event.is_set():
+        print("OPTIMIZATION STOPPED BY USER")
+    else:
+        print("OPTIMIZATION COMPLETED")
+    print("=" * 60)
+    
+    if len(study.trials) > 0:
+        print("Best hyperparameters:", study.best_params)
+        print(f"Best value: {study.best_value:.6f}")
+        
+        try:
+            with open("best_hyperparams.json", "w") as f:
+                json.dump(study.best_params, f, indent=4)
+            print("Best hyperparameters saved to best_hyperparams.json")
+        except Exception as e:
+            print(f"Error saving best_hyperparams.json: {e}")
+    else:
+        print("No completed trials found.")
 
     # Return new config with best params
     new_config = load_config()
