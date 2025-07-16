@@ -1,16 +1,34 @@
-ninja
-cmake
+# Core Dependencies
+torch>=2.0.0
+numpy
+matplotlib
+optuna>=3.0.0
+
+# Dataset handling
+datasets
+
+# Development and build tools (for PyTorch compilation)
 setuptools>=40.8.0
 wheel
-cmake>=3.18,<4.0
-ninja>=1.11.1
-pybind11>=2.13.1
-lit
-numpy
-torch
-tqdm
-mmap
-matplotlib
-scikit-learn
-# Optional: for Jupyter notebook support
-# jupyter
+
+# Optional: Enhanced performance and development
+# ninja  # Uncomment if you need faster PyTorch compilation
+# cmake>=3.18,<4.0  # Uncomment if building PyTorch from source
+
+# Python standard library packages (included with Python):
+# tkinter - GUI framework (included with Python)
+# threading - Multi-threading support (included with Python)
+# queue - Thread-safe queues (included with Python)
+# json - JSON parsing (included with Python)
+# os - Operating system interface (included with Python)
+# sys - System-specific parameters (included with Python)
+# time - Time-related functions (included with Python)
+# gc - Garbage collection (included with Python)
+# dataclasses - Data classes (included with Python 3.7+)
+
+# Removed packages:
+# - tqdm: Not actually used in the codebase
+# - mmap: Not used in the current implementation
+# - scikit-learn: Not used in the current implementation
+# - pybind11: Only needed if compiling PyTorch extensions
+# - lit: Only needed for PyTorch development/testing
