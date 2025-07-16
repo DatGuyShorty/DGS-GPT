@@ -125,11 +125,24 @@ class GPT_GUI:
             messagebox.showerror("Invalid Input", "Please enter positive integers for trials and steps per trial.")
             return
 
+        # Get architecture configuration from GUI
+        arch_config = self.get_architecture_config()
+        
+        # Validate configuration
+        if arch_config.attention_type == 'grouped_query' and arch_config.n_head % arch_config.n_query_groups != 0:
+            messagebox.showerror("Invalid Configuration", 
+                               f"Number of heads ({arch_config.n_head}) must be divisible by query groups ({arch_config.n_query_groups})")
+            return
+
         self.optimize_button.config(state="disabled")
         self.stop_optimize_button.config(state="normal")
         self.train_button.config(state="disabled")
         self.generate_button.config(state="disabled")
-        self.status_text.set(f"Running hyperparameter optimization with {n_trials} trials...")
+        
+        # Update status with architecture info
+        moe_info = f" with MoE ({arch_config.moe_num_experts} experts)" if arch_config.use_moe else ""
+        attn_info = f" using {arch_config.attention_type} attention"
+        self.status_text.set(f"Running optimization with {n_trials} trials{moe_info}{attn_info}...")
         
         # Clear log
         self.optim_log_text.config(state="normal")
@@ -142,19 +155,19 @@ class GPT_GUI:
         self.optim_queue = queue.Queue()
         self.stop_optimization_event = threading.Event()
         
-        thread = threading.Thread(target=self.run_optimization_thread, args=(n_trials, steps_per_trial))
+        thread = threading.Thread(target=self.run_optimization_thread, args=(n_trials, steps_per_trial, arch_config))
         thread.daemon = True
         thread.start()
         
         # Start updating the log display
         self.root.after(100, self.process_optim_queue)
 
-    def run_optimization_thread(self, n_trials, steps_per_trial):
+    def run_optimization_thread(self, n_trials, steps_per_trial, arch_config):
         original_stdout = sys.stdout
         sys.stdout = QueueStream(self.optim_queue)
 
         try:
-            new_config = run_hyperparameter_optimization(self.config, n_trials, steps_per_trial)
+            new_config = run_hyperparameter_optimization(arch_config, n_trials, steps_per_trial)
             self.root.after(0, self.on_optimization_complete, new_config)
         except Exception as e:
             print(f"\n--- OPTIMIZATION FAILED ---\n{e}")
@@ -199,6 +212,15 @@ class GPT_GUI:
         messagebox.showinfo("Optimization Complete", "Hyperparameter optimization finished. The model has been updated with the best parameters found.")
         self.config = new_config
         self.config.vocab_size = vocab_size # Also update vocab size on new config
+        
+        # Update GUI controls with the new configuration
+        self.use_moe_var.set(new_config.use_moe)
+        self.moe_experts_var.set(str(new_config.moe_num_experts))
+        self.moe_k_var.set(str(new_config.moe_k))
+        self.attention_type_var.set(new_config.attention_type)
+        self.query_groups_var.set(str(new_config.n_query_groups))
+        self.on_attention_type_change()  # Update query groups combo state
+        
         self.trainer = Trainer(self.config, loss_callback=self.queue_loss)
         self.update_hyperparameter_display()  # Update the display with new hyperparameters
         self.status_text.set("Model updated with new hyperparameters.")
@@ -321,6 +343,54 @@ https://github.com/DatGuyShorty/DGS-GPT"""
         self.steps_per_trial_input.insert(0, "100")
         self.steps_per_trial_input.pack(side='left', padx=5)
 
+        # Architecture settings frame
+        arch_frame = tk.LabelFrame(hyperparam_frame, text="Architecture Settings", padx=10, pady=5)
+        arch_frame.pack(fill='x', pady=5)
+
+        # MoE settings
+        moe_frame = tk.Frame(arch_frame)
+        moe_frame.pack(fill='x', pady=2)
+        
+        self.use_moe_var = tk.BooleanVar(value=self.config.use_moe)
+        tk.Checkbutton(moe_frame, text="Use Mixture of Experts (MoE)", variable=self.use_moe_var, 
+                      command=self.on_moe_toggle).pack(side='left', padx=5)
+        
+        tk.Label(moe_frame, text="Experts:").pack(side='left', padx=(20,5))
+        self.moe_experts_var = tk.StringVar(value=str(self.config.moe_num_experts))
+        moe_experts_combo = ttk.Combobox(moe_frame, textvariable=self.moe_experts_var, 
+                                        values=["2", "4", "8"], width=5, state="readonly")
+        moe_experts_combo.pack(side='left', padx=5)
+        
+        tk.Label(moe_frame, text="Top-K:").pack(side='left', padx=(10,5))
+        self.moe_k_var = tk.StringVar(value=str(self.config.moe_k))
+        moe_k_combo = ttk.Combobox(moe_frame, textvariable=self.moe_k_var, 
+                                  values=["1", "2"], width=5, state="readonly")
+        moe_k_combo.pack(side='left', padx=5)
+
+        # Attention type settings
+        attn_frame = tk.Frame(arch_frame)
+        attn_frame.pack(fill='x', pady=2)
+        
+        tk.Label(attn_frame, text="Attention Type:").pack(side='left', padx=5)
+        self.attention_type_var = tk.StringVar(value=self.config.attention_type)
+        attn_combo = ttk.Combobox(attn_frame, textvariable=self.attention_type_var, 
+                                 values=["multihead", "grouped_query"], width=15, state="readonly",
+                                 command=self.on_attention_type_change)
+        attn_combo.pack(side='left', padx=5)
+        
+        tk.Label(attn_frame, text="Query Groups:").pack(side='left', padx=(20,5))
+        self.query_groups_var = tk.StringVar(value=str(self.config.n_query_groups))
+        self.query_groups_combo = ttk.Combobox(attn_frame, textvariable=self.query_groups_var, 
+                                              values=["1", "2", "4", "8"], width=5, state="readonly")
+        self.query_groups_combo.pack(side='left', padx=5)
+        
+        # Update query groups based on initial attention type
+        self.on_attention_type_change()
+
+        # Controls frame (moved after architecture settings)
+        controls_frame = tk.Frame(hyperparam_frame)
+        controls_frame.pack(fill='x', pady=5)
+        
         self.optimize_button = tk.Button(controls_frame, text="Start Optimization", command=self.start_optimization_thread)
         self.optimize_button.pack(side='left', padx=5)
 
@@ -336,6 +406,40 @@ https://github.com/DatGuyShorty/DGS-GPT"""
         self.optim_log_text = scrolledtext.ScrolledText(hyperparam_frame, height=20, wrap=tk.WORD, state="disabled")
         self.optim_log_text.pack(fill="both", expand=True, pady=5)
 
+    def on_moe_toggle(self):
+        """Handle MoE checkbox toggle"""
+        # Enable/disable MoE-related controls based on checkbox state
+        pass  # Controls are always enabled for user choice
+
+    def on_attention_type_change(self, event=None):
+        """Handle attention type change"""
+        attention_type = self.attention_type_var.get()
+        if attention_type == "grouped_query":
+            # Enable query groups combo
+            self.query_groups_combo.config(state="readonly")
+        else:
+            # Disable query groups combo for multihead attention
+            self.query_groups_combo.config(state="disabled")
+            self.query_groups_var.set("1")  # Reset to 1 for multihead
+
+    def get_architecture_config(self):
+        """Get architecture configuration from GUI controls"""
+        arch_config = Config()
+        
+        # Copy base config values
+        for attr in dir(self.config):
+            if not attr.startswith('_') and hasattr(arch_config, attr):
+                setattr(arch_config, attr, getattr(self.config, attr))
+        
+        # Update with GUI values
+        arch_config.use_moe = self.use_moe_var.get()
+        arch_config.moe_num_experts = int(self.moe_experts_var.get())
+        arch_config.moe_k = int(self.moe_k_var.get())
+        arch_config.attention_type = self.attention_type_var.get()
+        arch_config.n_query_groups = int(self.query_groups_var.get())
+        
+        return arch_config
+
     def update_hyperparameter_display(self):
         """Update the hyperparameter display with current config values"""
         config_text = f"""Learning Rate: {self.config.learning_rate}
@@ -346,15 +450,17 @@ Number of Heads: {self.config.n_head}
 Block Size: {self.config.block_size}
 Batch Size: {self.config.batch_size}
 Dropout: {self.config.dropout}
-Attention Type: {self.config.attention_type}
-Use MoE: {self.config.use_moe}"""
+
+Architecture Settings:
+Attention Type: {self.config.attention_type}"""
         
         if hasattr(self.config, 'n_query_groups') and self.config.n_query_groups is not None:
             config_text += f"\nQuery Groups: {self.config.n_query_groups}"
         
+        config_text += f"\nUse MoE: {self.config.use_moe}"
         if self.config.use_moe:
             config_text += f"\nMoE Experts: {self.config.moe_num_experts}"
-            config_text += f"\nMoE K: {self.config.moe_k}"
+            config_text += f"\nMoE Top-K: {self.config.moe_k}"
         
         config_text += f"\nVocabulary Size: {self.config.vocab_size}"
         

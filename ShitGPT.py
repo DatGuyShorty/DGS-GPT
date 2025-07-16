@@ -305,7 +305,7 @@ class Trainer:
             return False
 
 # Hyperparameter optimization using Optuna
-def objective(trial, steps_per_trial):
+def objective(trial, steps_per_trial, base_config):
     # Suggest hyperparameters
     trial_config = Config()
     trial_config.learning_rate = trial.suggest_float('learning_rate', 1e-5, 1e-2, log=True)
@@ -322,14 +322,23 @@ def objective(trial, steps_per_trial):
 
     trial_config.n_head = trial.suggest_categorical('n_head', [4, 8, 16])
     trial_config.dropout = trial.suggest_float('dropout', 0.05, 0.3)
-    trial_config.use_moe = trial.suggest_categorical('use_moe', [False, True])
-    if trial_config.use_moe:
-        trial_config.moe_num_experts = trial.suggest_categorical('moe_num_experts', [2, 4, 8])
-        trial_config.moe_k = trial.suggest_int('moe_k', 1, 2)
-    trial_config.attention_type = trial.suggest_categorical('attention_type', ['multihead', 'grouped_query'])
+    
+    # Use fixed architectural choices from base_config instead of optimizing them
+    trial_config.use_moe = base_config.use_moe
+    trial_config.moe_num_experts = base_config.moe_num_experts
+    trial_config.moe_k = base_config.moe_k
+    trial_config.attention_type = base_config.attention_type
+    trial_config.n_query_groups = base_config.n_query_groups
+    
+    # Validate n_query_groups for grouped query attention
     if trial_config.attention_type == 'grouped_query':
-        possible_groups = [g for g in [1, 2, 4] if trial_config.n_head % g == 0]
-        trial_config.n_query_groups = trial.suggest_categorical('n_query_groups', possible_groups)
+        if trial_config.n_head % trial_config.n_query_groups != 0:
+            # Adjust n_query_groups to be compatible with n_head
+            possible_groups = [g for g in [1, 2, 4, 8] if trial_config.n_head % g == 0]
+            if possible_groups:
+                trial_config.n_query_groups = possible_groups[0]  # Use the first valid option
+            else:
+                trial_config.n_query_groups = 1  # Fallback to 1
 
     trial_config.vocab_size = len(chars)
 
@@ -384,7 +393,7 @@ def run_hyperparameter_optimization(config: Config, n_trials: int, steps_per_tri
         study_name="gpt-optimization-v2",
         load_if_exists=True
     )
-    study.optimize(lambda trial: objective(trial, steps_per_trial), n_trials=n_trials, show_progress_bar=True)
+    study.optimize(lambda trial: objective(trial, steps_per_trial, config), n_trials=n_trials, show_progress_bar=True)
     
     print("Best hyperparameters:", study.best_params)
     try:
