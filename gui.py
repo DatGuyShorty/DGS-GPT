@@ -23,6 +23,7 @@ try:
         device,
         vocab_size
     )
+    from version import __version__, get_version_info
 except ImportError as e:
     messagebox.showerror("Import Error", f"Failed to import from ShitGPT.py: {e}\nMake sure both files are in the same directory.")
     exit()
@@ -39,7 +40,7 @@ class QueueStream(object):
 class GPT_GUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("ShitGPT GUI")
+        self.root.title(f"DGS-GPT v{__version__}")
         self.root.geometry("800x750")
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
@@ -81,6 +82,10 @@ class GPT_GUI:
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.on_closing)
         menubar.add_cascade(label="File", menu=file_menu)
+
+        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="About", command=self.show_about)
+        menubar.add_cascade(label="Help", menu=help_menu)
 
         self.root.config(menu=menubar)
 
@@ -197,6 +202,29 @@ class GPT_GUI:
         self.trainer = Trainer(self.config, loss_callback=self.queue_loss)
         self.update_hyperparameter_display()  # Update the display with new hyperparameters
         self.status_text.set("Model updated with new hyperparameters.")
+
+    def show_about(self):
+        """Show about dialog with version information"""
+        version_info = get_version_info()
+        about_text = f"""DGS-GPT v{version_info['version']}
+
+{version_info['description']}
+
+Author: {version_info['author']}
+License: {version_info['license']}
+
+A modern GPT implementation featuring:
+• Advanced transformer architecture
+• Multi-head and grouped query attention
+• Mixture of Experts (MoE) support
+• Real-time training visualization
+• Hyperparameter optimization with Optuna
+• Cross-platform compatibility
+
+For more information, visit:
+https://github.com/DatGuyShorty/DGS-GPT"""
+        
+        messagebox.showinfo("About DGS-GPT", about_text)
 
     def on_closing(self):
         self.root.destroy()

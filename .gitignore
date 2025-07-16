@@ -2,16 +2,19 @@
 best_hyperparams.json
 gpt_model.pth
 optuna_study.db
+*.db
 val_split.txt
 test_split.txt
 train_split.txt
 vocab.txt
 
-
-# Python cache
+# Python cache and build artifacts
 __pycache__/
 *.py[cod]
 *.egg-info/
+build/
+dist/
+*.egg
 
 # Virtual environments
 venv/
@@ -22,3 +25,33 @@ env/
 # IDE configuration
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+
+# Model checkpoints and large files
+*.pth
+*.pt
+*.safetensors
+*.bin
+
+# Data files (should be downloaded/generated)
+*.txt
+!requirements.txt
+!README.md
+!CHANGELOG.md
+!LICENSE
