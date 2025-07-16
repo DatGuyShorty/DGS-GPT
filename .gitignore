@@ -1,0 +1,24 @@
+# Generated files and artifacts
+best_hyperparams.json
+gpt_model.pth
+optuna_study.db
+val_split.txt
+test_split.txt
+train_split.txt
+vocab.txt
+
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env
+
+# IDE configuration
+.vscode/
+.idea/
