@@ -35,6 +35,8 @@ class Config:
     weight_decay: float = 1e-5 # weight decay
     batch_size: int = 2 # batch size
     max_iters: int = 1000 # maximum training iterations
+    grad_clip: float = 1.0 # gradient clipping threshold
+    warmup_iters: int = 100 # learning rate warmup iterations
 
 def load_config(filepath="best_hyperparams.json"):
     default_config = Config()
@@ -249,14 +251,167 @@ class GPTLanguageModel(nn.Module):
             return logits, loss
         return logits, None
 
-    def generate(self, idx, max_new_tokens):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None):
+        """
+        Advanced text generation with temperature and nucleus sampling
+        
+        Args:
+            idx: Starting token indices
+            max_new_tokens: Number of tokens to generate
+            temperature: Sampling temperature (higher = more random)
+            top_k: Only consider top-k tokens (if specified)
+            top_p: Nucleus sampling - consider tokens with cumulative probability up to top_p
+        """
         for _ in range(max_new_tokens):
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             logits, _ = self(idx_cond)
-            probs = F.softmax(logits[:, -1, :], dim=-1)
+            logits = logits[:, -1, :] / temperature  # Apply temperature
+            
+            # Apply top-k filtering
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            
+            # Apply nucleus (top-p) sampling
+            if top_p is not None:
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                
+                # Remove tokens with cumulative probability above the threshold
+                sorted_indices_to_remove = cumulative_probs > top_p
+                # Shift the indices to the right to keep also the first token above the threshold
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                
+                # Create a mask for the original logits
+                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                logits[indices_to_remove] = -float('Inf')
+            
+            probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
             idx = torch.cat([idx, next_token], dim=1)
         return idx
+
+    def generate_batch(self, prompts, max_new_tokens=200, temperature=1.0, top_k=None, top_p=None):
+        """
+        Generate text for multiple prompts in a batch
+        """
+        self.eval()
+        batch_size = len(prompts)
+        
+        # Encode all prompts
+        encoded_prompts = [torch.tensor(encode(prompt), dtype=torch.long, device=device) for prompt in prompts]
+        
+        # Pad to same length
+        max_len = max(len(p) for p in encoded_prompts)
+        padded_prompts = []
+        for prompt in encoded_prompts:
+            if len(prompt) < max_len:
+                padding = torch.zeros(max_len - len(prompt), dtype=torch.long, device=device)
+                padded_prompt = torch.cat([prompt, padding])
+            else:
+                padded_prompt = prompt
+            padded_prompts.append(padded_prompt)
+        
+        idx = torch.stack(padded_prompts)
+        
+        with torch.no_grad():
+            for _ in range(max_new_tokens):
+                idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+                logits, _ = self(idx_cond)
+                logits = logits[:, -1, :] / temperature
+                
+                # Apply top-k filtering
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+                
+                # Apply nucleus (top-p) sampling
+                if top_p is not None:
+                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                    sorted_indices_to_remove[..., 0] = 0
+                    indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                    logits[indices_to_remove] = -float('Inf')
+                
+                probs = F.softmax(logits, dim=-1)
+                next_tokens = torch.multinomial(probs, num_samples=1)
+                idx = torch.cat([idx, next_tokens], dim=1)
+        
+        self.train()
+        return [decode(seq.tolist()) for seq in idx]
+
+    def beam_search_generate(self, idx, max_new_tokens=200, beam_size=4, temperature=1.0):
+        """
+        Generate text using beam search for better quality
+        """
+        self.eval()
+        batch_size = idx.size(0)
+        
+        # Initialize beams: (batch_size * beam_size, seq_len)
+        beams = idx.repeat(beam_size, 1)  # Replicate for each beam
+        beam_scores = torch.zeros(batch_size * beam_size, device=device)
+        
+        with torch.no_grad():
+            for step in range(max_new_tokens):
+                # Get logits for all beams
+                idx_cond = beams if beams.size(1) <= self.config.block_size else beams[:, -self.config.block_size:]
+                logits, _ = self(idx_cond)
+                logits = logits[:, -1, :] / temperature
+                
+                # Convert to log probabilities
+                log_probs = F.log_softmax(logits, dim=-1)
+                
+                # For each sequence in batch
+                all_candidates = []
+                for i in range(batch_size):
+                    beam_start = i * beam_size
+                    beam_end = (i + 1) * beam_size
+                    
+                    # Get top k tokens for each beam
+                    candidates = []
+                    for beam_idx in range(beam_start, beam_end):
+                        beam_score = beam_scores[beam_idx]
+                        beam_log_probs = log_probs[beam_idx]
+                        
+                        # Get top beam_size tokens
+                        top_log_probs, top_indices = torch.topk(beam_log_probs, beam_size)
+                        
+                        for k in range(beam_size):
+                            candidate_score = beam_score + top_log_probs[k]
+                            candidate_seq = torch.cat([beams[beam_idx], top_indices[k].unsqueeze(0)])
+                            candidates.append((candidate_score, candidate_seq, beam_idx))
+                    
+                    # Select top beam_size candidates
+                    candidates.sort(key=lambda x: x[0], reverse=True)
+                    all_candidates.extend(candidates[:beam_size])
+                
+                # Update beams with best candidates
+                new_beams = []
+                new_scores = []
+                for i, (score, seq, _) in enumerate(all_candidates):
+                    new_beams.append(seq)
+                    new_scores.append(score)
+                
+                beams = torch.stack(new_beams)
+                beam_scores = torch.stack(new_scores)
+        
+        self.train()
+        
+        # Return best sequence for each batch item
+        best_sequences = []
+        for i in range(batch_size):
+            beam_start = i * beam_size
+            beam_end = (i + 1) * beam_size
+            # Select the best beam for this batch item
+            local_beam_scores = beam_scores[beam_start:beam_end]
+            local_beams = beams[beam_start:beam_end]
+            best_beam_idx = torch.argmax(local_beam_scores)
+            best_sequences.append(local_beams[best_beam_idx])
+        
+        return torch.stack(best_sequences)
 
 class Trainer:
     def __init__(self, config: Config, loss_callback=None):
@@ -265,43 +420,147 @@ class Trainer:
         self.optimizer = optim.AdamW(self.model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
         self.scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
         self.loss_callback = loss_callback
+        
+        # Add learning rate scheduler
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, 
+            T_max=config.max_iters,
+            eta_min=config.learning_rate * 0.1  # Min LR is 10% of initial
+        )
 
     def train(self, max_iters, plot_step_size=100, stop_event=None, progress_callback=None):
         print(f"Starting training for {max_iters} iterations...")
+        best_loss = float('inf')
+        running_loss = 0.0
+        
         for it in range(max_iters):
             if stop_event and stop_event.is_set():
                 print("Training stopped by user.")
                 break
 
+            # Learning rate warmup
+            if it < self.config.warmup_iters:
+                lr = self.config.learning_rate * (it + 1) / self.config.warmup_iters
+                for param_group in self.optimizer.param_groups:
+                    param_group['lr'] = lr
+
             xb, yb = get_batch(self.config)
             self.optimizer.zero_grad()
+            
             if device.type == "cuda":
                 with torch.amp.autocast('cuda'):
                     _, loss = self.model(xb, yb)
                 self.scaler.scale(loss).backward()
+                
+                # Gradient clipping
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+                
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 _, loss = self.model(xb, yb)
                 loss.backward()
+                
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+                
                 self.optimizer.step()
 
+            # Update learning rate scheduler (after warmup)
+            if it >= self.config.warmup_iters:
+                self.scheduler.step()
+            
+            current_lr = self.optimizer.param_groups[0]['lr']
+            running_loss += loss.item()
+
             if it % plot_step_size == 0 or it == max_iters - 1:
+                avg_loss = running_loss / (plot_step_size if it > 0 else 1)
+                running_loss = 0.0
+                
                 if self.loss_callback:
                     self.loss_callback(loss.item())
-                print(f"Iter {it}: loss={loss.item():.4f}")
+                print(f"Iter {it}: loss={loss.item():.4f}, avg_loss={avg_loss:.4f}, lr={current_lr:.6f}")
+                
+                # Save best model
+                if loss.item() < best_loss:
+                    best_loss = loss.item()
+                    self.save_model("best_model.pth")
+                    print(f"New best model saved with loss: {best_loss:.4f}")
             
             if progress_callback:
                 progress_callback(it + 1)
-        print("Training complete.")
+        
+        print(f"Training complete. Best loss: {best_loss:.4f}")
+        self.save_model("final_model.pth")
+
+    def evaluate(self, eval_iters=100):
+        """
+        Evaluate the model and calculate perplexity
+        """
+        self.model.eval()
+        total_loss = 0.0
+        
+        with torch.no_grad():
+            for _ in range(eval_iters):
+                xb, yb = get_batch(self.config)
+                if device.type == "cuda":
+                    with torch.amp.autocast('cuda'):
+                        _, loss = self.model(xb, yb)
+                else:
+                    _, loss = self.model(xb, yb)
+                total_loss += loss.item()
+        
+        avg_loss = total_loss / eval_iters
+        perplexity = torch.exp(torch.tensor(avg_loss)).item()
+        
+        self.model.train()
+        return avg_loss, perplexity
 
     def save_model(self, filepath="gpt_model.pth"):
+        """Enhanced model saving with metadata"""
         try:
-            torch.save(self.model.state_dict(), filepath)
+            checkpoint = {
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'config': asdict(self.config),
+                'model_info': {
+                    'total_params': sum(p.numel() for p in self.model.parameters()),
+                    'trainable_params': sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+                }
+            }
+            torch.save(checkpoint, filepath)
             print(f"Model saved to {filepath}")
             return True
         except Exception as e:
             print(f"Error saving model: {e}")
+            return False
+
+    def load_model(self, filepath="gpt_model.pth"):
+        """Enhanced model loading"""
+        try:
+            checkpoint = torch.load(filepath, map_location=device)
+            
+            # Load model state
+            if 'model_state_dict' in checkpoint:
+                self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            else:
+                # Backward compatibility with old saves
+                self.model.load_state_dict(checkpoint, strict=False)
+            
+            # Load optimizer state if available
+            if 'optimizer_state_dict' in checkpoint:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            
+            # Print model info if available
+            if 'model_info' in checkpoint:
+                info = checkpoint['model_info']
+                print(f"Loaded model with {info['total_params']:,} parameters")
+            
+            print(f"Model loaded from {filepath}")
+            return True
+        except Exception as e:
+            print(f"Error loading model: {e}")
             return False
 
 # Hyperparameter optimization using Optuna

@@ -383,13 +383,67 @@ https://github.com/DatGuyShorty/DGS-GPT"""
         gen_frame = ttk.Frame(self.notebook, padding="10")
         self.notebook.add(gen_frame, text='Text Generation')
 
+        # Prompt input section
         tk.Label(gen_frame, text="Enter your prompt:").pack(pady=5, anchor="w")
-        self.prompt_input = scrolledtext.ScrolledText(gen_frame, height=8, width=80, wrap=tk.WORD)
-        self.prompt_input.pack(pady=5, fill="x", expand=True)
+        self.prompt_input = scrolledtext.ScrolledText(gen_frame, height=6, width=80, wrap=tk.WORD)
+        self.prompt_input.pack(pady=5, fill="x", expand=False)
 
+        # Advanced generation settings frame
+        settings_frame = tk.LabelFrame(gen_frame, text="Generation Settings", padx=10, pady=5)
+        settings_frame.pack(fill='x', pady=5)
+        
+        # First row of settings
+        settings_row1 = tk.Frame(settings_frame)
+        settings_row1.pack(fill='x', pady=2)
+        
+        tk.Label(settings_row1, text="Max Tokens:").pack(side='left', padx=5)
+        self.max_tokens_entry = tk.Entry(settings_row1, width=8)
+        self.max_tokens_entry.insert(0, "200")
+        self.max_tokens_entry.pack(side='left', padx=5)
+        
+        tk.Label(settings_row1, text="Temperature:").pack(side='left', padx=(20,5))
+        self.temperature_entry = tk.Entry(settings_row1, width=8)
+        self.temperature_entry.insert(0, "1.0")
+        self.temperature_entry.pack(side='left', padx=5)
+        
+        tk.Label(settings_row1, text="Top-K:").pack(side='left', padx=(20,5))
+        self.top_k_entry = tk.Entry(settings_row1, width=8)
+        self.top_k_entry.insert(0, "50")
+        self.top_k_entry.pack(side='left', padx=5)
+        
+        # Second row of settings
+        settings_row2 = tk.Frame(settings_frame)
+        settings_row2.pack(fill='x', pady=2)
+        
+        tk.Label(settings_row2, text="Top-P:").pack(side='left', padx=5)
+        self.top_p_entry = tk.Entry(settings_row2, width=8)
+        self.top_p_entry.insert(0, "0.9")
+        self.top_p_entry.pack(side='left', padx=5)
+        
+        self.use_top_k_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(settings_row2, text="Use Top-K", variable=self.use_top_k_var).pack(side='left', padx=20)
+        
+        self.use_top_p_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(settings_row2, text="Use Top-P", variable=self.use_top_p_var).pack(side='left', padx=10)
+
+        # Advanced generation modes
+        modes_frame = tk.LabelFrame(gen_frame, text="Generation Mode", padx=10, pady=5)
+        modes_frame.pack(fill='x', pady=5)
+        
+        self.generation_mode = tk.StringVar(value="standard")
+        tk.Radiobutton(modes_frame, text="Standard", variable=self.generation_mode, value="standard").pack(side='left', padx=5)
+        tk.Radiobutton(modes_frame, text="Beam Search", variable=self.generation_mode, value="beam").pack(side='left', padx=5)
+        
+        tk.Label(modes_frame, text="Beam Size:").pack(side='left', padx=(20,5))
+        self.beam_size_entry = tk.Entry(modes_frame, width=6)
+        self.beam_size_entry.insert(0, "4")
+        self.beam_size_entry.pack(side='left', padx=5)
+
+        # Generation button
         self.generate_button = tk.Button(gen_frame, text="Generate Text", command=self.start_generation_thread)
         self.generate_button.pack(pady=10)
 
+        # Output section
         tk.Label(gen_frame, text="Generated Text:").pack(pady=5, anchor="w")
         self.output_text = scrolledtext.ScrolledText(gen_frame, height=15, width=80, wrap=tk.WORD, state="disabled")
         self.output_text.pack(pady=5, fill="both", expand=True)
@@ -398,23 +452,45 @@ https://github.com/DatGuyShorty/DGS-GPT"""
         train_frame = ttk.Frame(self.notebook, padding="10")
         self.notebook.add(train_frame, text='Training')
 
+        # Controls frame with evaluation
         controls_frame = tk.Frame(train_frame)
         controls_frame.pack(fill='x', pady=5)
-        tk.Label(controls_frame, text="Iterations:").pack(side='left', padx=5)
-        self.iters_input = tk.Entry(controls_frame, width=10)
+        
+        # First row - main controls
+        controls_row1 = tk.Frame(controls_frame)
+        controls_row1.pack(fill='x', pady=2)
+        
+        tk.Label(controls_row1, text="Iterations:").pack(side='left', padx=5)
+        self.iters_input = tk.Entry(controls_row1, width=10)
         self.iters_input.insert(0, "1000")
         self.iters_input.pack(side='left', padx=5)
 
-        tk.Label(controls_frame, text="Plot Step:").pack(side='left', padx=5)
-        self.plot_step_input = tk.Entry(controls_frame, width=10)
+        tk.Label(controls_row1, text="Plot Step:").pack(side='left', padx=5)
+        self.plot_step_input = tk.Entry(controls_row1, width=10)
         self.plot_step_input.insert(0, "100")
         self.plot_step_input.pack(side='left', padx=5)
 
-        self.train_button = tk.Button(controls_frame, text="Start Training", command=self.start_training_thread)
+        self.train_button = tk.Button(controls_row1, text="Start Training", command=self.start_training_thread)
         self.train_button.pack(side='left', padx=5)
 
-        self.stop_button = tk.Button(controls_frame, text="Stop Training", command=self.stop_training, state="disabled")
+        self.stop_button = tk.Button(controls_row1, text="Stop Training", command=self.stop_training, state="disabled")
         self.stop_button.pack(side='left', padx=5)
+        
+        # Second row - evaluation controls
+        controls_row2 = tk.Frame(controls_frame)
+        controls_row2.pack(fill='x', pady=2)
+        
+        self.eval_button = tk.Button(controls_row2, text="Evaluate Model", command=self.evaluate_model)
+        self.eval_button.pack(side='left', padx=5)
+        
+        tk.Label(controls_row2, text="Eval Iters:").pack(side='left', padx=5)
+        self.eval_iters_input = tk.Entry(controls_row2, width=8)
+        self.eval_iters_input.insert(0, "100")
+        self.eval_iters_input.pack(side='left', padx=5)
+        
+        # Evaluation results
+        self.eval_results_label = tk.Label(controls_row2, text="", fg="blue")
+        self.eval_results_label.pack(side='left', padx=20)
 
         # Progress bar
         self.progress_bar = ttk.Progressbar(train_frame, orient='horizontal', mode='determinate')
@@ -1086,11 +1162,39 @@ Attention Type: {self.config.attention_type}"""
             self.root.after(0, lambda: self.train_button.config(state="normal"))
             return
 
+        # Get generation settings
+        try:
+            max_tokens = int(self.max_tokens_entry.get())
+            temperature = float(self.temperature_entry.get())
+            top_k = int(self.top_k_entry.get()) if self.use_top_k_var.get() else None
+            top_p = float(self.top_p_entry.get()) if self.use_top_p_var.get() else None
+            beam_size = int(self.beam_size_entry.get()) if self.generation_mode.get() == "beam" else 1
+        except ValueError as e:
+            messagebox.showerror("Invalid Input", f"Invalid generation setting value: {e}")
+            return
+
         try:
             with torch.no_grad():
                 self.trainer.model.eval()
                 idx = torch.tensor(encode(prompt), dtype=torch.long, device=device).unsqueeze(0)
-                gen_ids = self.trainer.model.generate(idx, max_new_tokens=200)
+                
+                if self.generation_mode.get() == "beam":
+                    # Beam search generation
+                    gen_ids = self.trainer.model.beam_search_generate(
+                        idx, 
+                        max_new_tokens=max_tokens, 
+                        beam_size=beam_size,
+                        temperature=temperature
+                    )
+                else:
+                    # Standard generation
+                    gen_ids = self.trainer.model.generate(
+                        idx, 
+                        max_new_tokens=max_tokens, 
+                        temperature=temperature, 
+                        top_k=top_k, 
+                        top_p=top_p
+                    )
                 generated_text = decode(gen_ids[0].tolist())
                 self.trainer.model.train()
 
@@ -1107,6 +1211,38 @@ Attention Type: {self.config.attention_type}"""
         self.output_text.insert(tk.END, text)
         self.output_text.config(state="disabled")
         self.status_text.set("Generation complete. Ready.")
+
+    def evaluate_model(self):
+        """Evaluate the current model and display results"""
+        try:
+            eval_iters = int(self.eval_iters_input.get())
+            if eval_iters <= 0:
+                raise ValueError("Evaluation iterations must be positive")
+        except ValueError as e:
+            messagebox.showerror("Invalid Input", f"Invalid evaluation iterations: {e}")
+            return
+        
+        self.eval_button.config(state="disabled")
+        self.status_text.set("Evaluating model...")
+        
+        # Run evaluation in thread to avoid blocking GUI
+        def eval_thread():
+            try:
+                avg_loss, perplexity = self.trainer.evaluate(eval_iters)
+                self.root.after(0, self.on_evaluation_complete, avg_loss, perplexity)
+            except Exception as e:
+                self.root.after(0, lambda: self.status_text.set(f"Evaluation error: {e}"))
+                self.root.after(0, lambda: self.eval_button.config(state="normal"))
+        
+        thread = threading.Thread(target=eval_thread)
+        thread.daemon = True
+        thread.start()
+    
+    def on_evaluation_complete(self, avg_loss, perplexity):
+        """Handle evaluation completion"""
+        self.eval_results_label.config(text=f"Loss: {avg_loss:.4f}, Perplexity: {perplexity:.2f}")
+        self.status_text.set(f"Evaluation complete. Perplexity: {perplexity:.2f}")
+        self.eval_button.config(state="normal")
 
 if __name__ == "__main__":
     root = tk.Tk()
