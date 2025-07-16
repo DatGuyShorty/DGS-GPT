@@ -46,6 +46,8 @@ class GPT_GUI:
         self.loss_queue = queue.Queue()
         self.losses = []
         self.stop_training_event = None
+        self.optim_queue = None
+        self.stop_optimization_event = None
         
         self.config = load_config()
         self.config.vocab_size = vocab_size # Set correct vocab size
@@ -66,6 +68,7 @@ class GPT_GUI:
 
         self.create_generation_tab()
         self.create_training_tab()
+        self.create_hyperparameter_tab()
 
         self.root.after(100, self.process_loss_queue)
 
@@ -78,10 +81,6 @@ class GPT_GUI:
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.on_closing)
         menubar.add_cascade(label="File", menu=file_menu)
-
-        actions_menu = tk.Menu(menubar, tearoff=0)
-        actions_menu.add_command(label="Run Hyperparameter Optimization", command=self.run_hyperparam_optimization_action)
-        menubar.add_cascade(label="Actions", menu=actions_menu)
 
         self.root.config(menu=menubar)
 
@@ -111,55 +110,92 @@ class GPT_GUI:
         elif filepath:
             messagebox.showerror("File Not Found", f"The file '{filepath}' does not exist.")
 
-    def run_hyperparam_optimization_action(self):
-        n_trials = simpledialog.askinteger("Optuna", "How many optimization trials to run?", initialvalue=10, minvalue=1)
-        if n_trials is None: return
-        steps_per_trial = simpledialog.askinteger("Optuna", "How many training steps per trial?", initialvalue=100, minvalue=1)
-        if steps_per_trial is None: return
+    def start_optimization_thread(self):
+        try:
+            n_trials = int(self.trials_input.get())
+            steps_per_trial = int(self.steps_per_trial_input.get())
+            if n_trials <= 0 or steps_per_trial <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Please enter positive integers for trials and steps per trial.")
+            return
 
-        log_window = tk.Toplevel(self.root)
-        log_window.title("Hyperparameter Optimization Log")
-        log_window.geometry("800x600")
-        log_text = scrolledtext.ScrolledText(log_window, wrap=tk.WORD, state='disabled')
-        log_text.pack(expand=True, fill='both')
+        self.optimize_button.config(state="disabled")
+        self.stop_optimize_button.config(state="normal")
+        self.train_button.config(state="disabled")
+        self.generate_button.config(state="disabled")
+        self.status_text.set(f"Running hyperparameter optimization with {n_trials} trials...")
+        
+        # Clear log
+        self.optim_log_text.config(state="normal")
+        self.optim_log_text.delete("1.0", tk.END)
+        self.optim_log_text.config(state="disabled")
 
-        thread = threading.Thread(
-            target=self.run_optimization_thread,
-            args=(n_trials, steps_per_trial, log_window, log_text)
-        )
+        self.optim_progress_bar['value'] = 0
+        self.optim_progress_bar['maximum'] = n_trials
+
+        self.optim_queue = queue.Queue()
+        self.stop_optimization_event = threading.Event()
+        
+        thread = threading.Thread(target=self.run_optimization_thread, args=(n_trials, steps_per_trial))
         thread.daemon = True
         thread.start()
+        
+        # Start updating the log display
+        self.root.after(100, self.process_optim_queue)
 
-    def run_optimization_thread(self, n_trials, steps_per_trial, log_window, log_text):
-        log_queue = queue.Queue()
+    def run_optimization_thread(self, n_trials, steps_per_trial):
         original_stdout = sys.stdout
-        sys.stdout = QueueStream(log_queue)
-
-        def update_log():
-            while not log_queue.empty():
-                line = log_queue.get_nowait()
-                log_text.config(state='normal')
-                log_text.insert(tk.END, line)
-                log_text.config(state='disabled')
-                log_text.see(tk.END)
-            log_window.after(100, update_log)
-
-        log_window.after(100, update_log)
+        sys.stdout = QueueStream(self.optim_queue)
 
         try:
             new_config = run_hyperparameter_optimization(self.config, n_trials, steps_per_trial)
             self.root.after(0, self.on_optimization_complete, new_config)
         except Exception as e:
             print(f"\n--- OPTIMIZATION FAILED ---\n{e}")
+            self.root.after(0, lambda: self.status_text.set(f"Optimization error: {e}"))
         finally:
             sys.stdout = original_stdout
-            print("Optimization process finished.")
+            self.root.after(0, self.optimization_finished)
+
+    def process_optim_queue(self):
+        updated = False
+        try:
+            while not self.optim_queue.empty():
+                line = self.optim_queue.get_nowait()
+                self.optim_log_text.config(state='normal')
+                self.optim_log_text.insert(tk.END, line)
+                self.optim_log_text.config(state='disabled')
+                self.optim_log_text.see(tk.END)
+                updated = True
+        except:
+            pass
+        
+        if updated:
+            self.root.update_idletasks()
+        
+        # Continue processing if optimization is running
+        if self.optimize_button['state'] == 'disabled':
+            self.root.after(100, self.process_optim_queue)
+
+    def stop_optimization(self):
+        if hasattr(self, 'stop_optimization_event'):
+            self.stop_optimization_event.set()
+        self.stop_optimize_button.config(state="disabled")
+        self.status_text.set("Stopping optimization...")
+
+    def optimization_finished(self):
+        self.optimize_button.config(state="normal")
+        self.stop_optimize_button.config(state="disabled")
+        self.train_button.config(state="normal")
+        self.generate_button.config(state="normal")
 
     def on_optimization_complete(self, new_config):
         messagebox.showinfo("Optimization Complete", "Hyperparameter optimization finished. The model has been updated with the best parameters found.")
         self.config = new_config
         self.config.vocab_size = vocab_size # Also update vocab size on new config
         self.trainer = Trainer(self.config, loss_callback=self.queue_loss)
+        self.update_hyperparameter_display()  # Update the display with new hyperparameters
         self.status_text.set("Model updated with new hyperparameters.")
 
     def on_closing(self):
@@ -220,6 +256,14 @@ class GPT_GUI:
         self.progress_bar = ttk.Progressbar(train_frame, orient='horizontal', mode='determinate')
         self.progress_bar.pack(fill='x', pady=5)
 
+        # Current hyperparameters display
+        hyperparam_display_frame = tk.LabelFrame(train_frame, text="Current Hyperparameters", padx=10, pady=5)
+        hyperparam_display_frame.pack(fill='x', pady=5)
+        
+        self.hyperparam_text = scrolledtext.ScrolledText(hyperparam_display_frame, height=8, wrap=tk.WORD, state="disabled")
+        self.hyperparam_text.pack(fill='x', pady=5)
+        self.update_hyperparameter_display()
+
         self.fig = Figure(figsize=(5, 4), dpi=100)
         self.ax = self.fig.add_subplot(111)
         self.ax.set_title("Training Loss")
@@ -230,6 +274,66 @@ class GPT_GUI:
         self.canvas = FigureCanvasTkAgg(self.fig, master=train_frame)
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+    def create_hyperparameter_tab(self):
+        hyperparam_frame = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(hyperparam_frame, text='Hyperparameter Optimization')
+
+        # Controls frame
+        controls_frame = tk.Frame(hyperparam_frame)
+        controls_frame.pack(fill='x', pady=5)
+        
+        tk.Label(controls_frame, text="Number of Trials:").pack(side='left', padx=5)
+        self.trials_input = tk.Entry(controls_frame, width=10)
+        self.trials_input.insert(0, "10")
+        self.trials_input.pack(side='left', padx=5)
+
+        tk.Label(controls_frame, text="Steps per Trial:").pack(side='left', padx=5)
+        self.steps_per_trial_input = tk.Entry(controls_frame, width=10)
+        self.steps_per_trial_input.insert(0, "100")
+        self.steps_per_trial_input.pack(side='left', padx=5)
+
+        self.optimize_button = tk.Button(controls_frame, text="Start Optimization", command=self.start_optimization_thread)
+        self.optimize_button.pack(side='left', padx=5)
+
+        self.stop_optimize_button = tk.Button(controls_frame, text="Stop Optimization", command=self.stop_optimization, state="disabled")
+        self.stop_optimize_button.pack(side='left', padx=5)
+
+        # Progress bar for optimization
+        self.optim_progress_bar = ttk.Progressbar(hyperparam_frame, orient='horizontal', mode='determinate')
+        self.optim_progress_bar.pack(fill='x', pady=5)
+
+        # Log display
+        tk.Label(hyperparam_frame, text="Optimization Log:").pack(pady=(10,5), anchor="w")
+        self.optim_log_text = scrolledtext.ScrolledText(hyperparam_frame, height=20, wrap=tk.WORD, state="disabled")
+        self.optim_log_text.pack(fill="both", expand=True, pady=5)
+
+    def update_hyperparameter_display(self):
+        """Update the hyperparameter display with current config values"""
+        config_text = f"""Learning Rate: {self.config.learning_rate}
+Weight Decay: {self.config.weight_decay}
+Embedding Dimension: {self.config.n_embd}
+Number of Layers: {self.config.n_layer}
+Number of Heads: {self.config.n_head}
+Block Size: {self.config.block_size}
+Batch Size: {self.config.batch_size}
+Dropout: {self.config.dropout}
+Attention Type: {self.config.attention_type}
+Use MoE: {self.config.use_moe}"""
+        
+        if hasattr(self.config, 'n_query_groups') and self.config.n_query_groups is not None:
+            config_text += f"\nQuery Groups: {self.config.n_query_groups}"
+        
+        if self.config.use_moe:
+            config_text += f"\nMoE Experts: {self.config.moe_num_experts}"
+            config_text += f"\nMoE K: {self.config.moe_k}"
+        
+        config_text += f"\nVocabulary Size: {self.config.vocab_size}"
+        
+        self.hyperparam_text.config(state="normal")
+        self.hyperparam_text.delete("1.0", tk.END)
+        self.hyperparam_text.insert(tk.END, config_text)
+        self.hyperparam_text.config(state="disabled")
 
     def queue_loss(self, loss):
         self.loss_queue.put(loss)
