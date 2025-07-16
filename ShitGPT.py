@@ -37,6 +37,66 @@ class Config:
     max_iters: int = 1000 # maximum training iterations
     grad_clip: float = 1.0 # gradient clipping threshold
     warmup_iters: int = 100 # learning rate warmup iterations
+    
+    # VRAM optimization settings
+    vram_profile: str = "low"  # "low" (15GB), "medium" (40GB), "high" (100GB+)
+    use_gradient_checkpointing: bool = True  # Enable for low VRAM
+    
+    @classmethod
+    def get_vram_optimized_config(cls, vram_profile="low", base_config=None):
+        """Get VRAM-optimized configuration based on available GPU memory"""
+        if base_config is None:
+            config = cls()
+        else:
+            config = base_config
+            
+        if vram_profile == "low":
+            # Conservative settings for 15GB VRAM
+            config.batch_size = 2
+            config.block_size = 512
+            config.n_embd = 1024
+            config.n_layer = 4
+            config.n_head = 4
+            config.dropout = 0.1
+            config.use_gradient_checkpointing = True
+            config.moe_num_experts = 4
+            config.moe_k = 1
+            print("Applied LOW VRAM profile (15GB) - Conservative settings")
+            
+        elif vram_profile == "medium":
+            # Standard settings for 40GB VRAM
+            config.batch_size = 16
+            config.block_size = 8192
+            config.n_embd = 4096
+            config.n_layer = 32
+            config.n_head = 32
+            config.dropout = 0.2
+            config.use_gradient_checkpointing = False
+            config.moe_num_experts = 8
+            config.moe_k = 2
+            print("Applied MEDIUM VRAM profile (40GB) - Standard settings")
+            
+        elif vram_profile == "high":
+            # Expanded settings for 100GB+ VRAM
+            config.batch_size = 32
+            config.block_size = 16384
+            config.n_embd = 5120
+            config.n_layer = 40
+            config.n_head = 40
+            config.dropout = 0.2
+            config.use_gradient_checkpointing = False
+            config.moe_num_experts = 16
+            config.moe_k = 4
+            print("Applied HIGH VRAM profile (100GB+) - Expanded settings")
+            
+        # Validate dimensions for RoPE and GQA
+        assert config.n_embd % 2 == 0, "n_embd must be even for RoPE"
+        assert config.n_embd % config.n_head == 0, "n_embd must be divisible by n_head"
+        if config.attention_type == "grouped_query":
+            assert config.n_head % config.n_query_groups == 0, "n_head must be divisible by n_query_groups"
+            
+        config.vram_profile = vram_profile
+        return config
 
 def load_config(filepath="best_hyperparams.json"):
     default_config = Config()
@@ -108,6 +168,64 @@ class MoE(nn.Module):
         for i, expert in enumerate(self.experts):
             expert_outputs.append(expert(x))  # (B, T, C)
         expert_outputs = torch.stack(expert_outputs, dim=-2)  # (B, T, num_experts, C)
+
+# Sparse Mixture of Experts (Enhanced MoE) from the notebook
+class SparseExpertLayer(nn.Module):
+    def __init__(self, n_embd, num_experts=8, num_active=2, capacity_factor=1.2, dropout=0.1):
+        super().__init__()
+        self.num_experts = num_experts
+        self.num_active = num_active
+        self.capacity_factor = capacity_factor
+        self.n_embd = n_embd
+        
+        self.gate = nn.Linear(n_embd, num_experts)
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(n_embd, 4 * n_embd),
+                nn.GELU(),  # Using GELU instead of ReLU
+                nn.Linear(4 * n_embd, n_embd),
+                nn.Dropout(dropout)
+            ) for _ in range(num_experts)
+        ])
+        
+    def forward(self, x):
+        B, T, C = x.shape
+        x_flat = x.view(-1, C)  # (B*T, C)
+        
+        # Calculate gates and expert assignment
+        gate_logits = self.gate(x_flat)  # (B*T, num_experts)
+        gates = F.softmax(gate_logits, dim=-1)
+        
+        # Get top-k experts for each token
+        expert_weights, expert_indices = torch.topk(gates, self.num_active, dim=-1)
+        expert_weights = expert_weights / expert_weights.sum(dim=-1, keepdim=True)
+        
+        # Initialize output
+        final_output = torch.zeros_like(x_flat)
+        
+        # Process each expert
+        for expert_idx in range(self.num_experts):
+            # Find tokens routed to this expert
+            expert_mask = (expert_indices == expert_idx).any(dim=-1)
+            expert_tokens = expert_mask.sum().item()
+            
+            if expert_tokens > 0:
+                # Get tokens for this expert
+                expert_input = x_flat[expert_mask]
+                
+                # Process through expert
+                expert_output = self.experts[expert_idx](expert_input)
+                
+                # Get weights for this expert
+                token_indices = torch.where(expert_mask)[0]
+                expert_weights_masked = expert_weights[expert_mask]
+                expert_pos = (expert_indices[expert_mask] == expert_idx).nonzero(as_tuple=True)[1]
+                weights = expert_weights_masked[torch.arange(len(expert_pos)), expert_pos]
+                
+                # Add weighted output
+                final_output[expert_mask] += expert_output * weights.unsqueeze(-1)
+        
+        return final_output.view(B, T, C)
         # Gather top-k expert outputs
         idx_expanded = topk_idx.unsqueeze(-1).expand(-1, -1, -1, x.size(-1))  # (B, T, k, C)
         topk_expert_outputs = torch.gather(expert_outputs, -2, idx_expanded)  # (B, T, k, C)
@@ -195,31 +313,180 @@ class GroupedQueryAttention(nn.Module):
         out = out.permute(0,2,1,3).contiguous().view(B, T, H*D)
         return self.out_proj(out)
 
+# Rotary Positional Embedding (RoPE) implementation
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_position_embeddings=2048):
+        super().__init__()
+        # Make sure dim is even
+        dim = dim if dim % 2 == 0 else dim - 1
+        
+        # Create inverse frequency bands
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer('inv_freq', inv_freq)
+        self.max_position_embeddings = max_position_embeddings
+        self.dim = dim
+
+    def forward(self, x, seq_len):
+        B, T, C = x.shape
+        
+        # Create position indices
+        t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
+        
+        # Calculate frequencies
+        freqs = torch.einsum('i,j->ij', t, self.inv_freq)  # [seq_len, dim/2]
+        
+        # Calculate cos and sin
+        cos = freqs.cos()  # [seq_len, dim/2]
+        sin = freqs.sin()  # [seq_len, dim/2]
+        
+        # Expand dimensions for broadcasting
+        cos = cos.view(1, T, -1)  # [1, seq_len, dim/2]
+        sin = sin.view(1, T, -1)  # [1, seq_len, dim/2]
+        
+        # Duplicate for all batch elements
+        cos = cos.expand(B, -1, -1)  # [batch, seq_len, dim/2]
+        sin = sin.expand(B, -1, -1)  # [batch, seq_len, dim/2]
+        
+        # Split input into even and odd dimensions
+        x1 = x[..., ::2]  # [batch, seq_len, dim/2]
+        x2 = x[..., 1::2]  # [batch, seq_len, dim/2]
+        
+        # Apply rotation
+        rotated_x = torch.cat([
+            x1 * cos - x2 * sin,
+            x2 * cos + x1 * sin
+        ], dim=-1)  # [batch, seq_len, dim]
+        
+        return rotated_x
+
+# Sliding Window Attention implementation
+class SlidingWindowAttention(nn.Module):
+    def __init__(self, n_embd, n_head, window_size=256, dropout=0.1, block_size=512):
+        super().__init__()
+        assert n_embd % n_head == 0
+        self.n_head = n_head
+        self.n_embd = n_embd
+        self.head_dim = n_embd // n_head
+        self.window_size = window_size
+        
+        self.query = nn.Linear(n_embd, n_embd)
+        self.key = nn.Linear(n_embd, n_embd)
+        self.value = nn.Linear(n_embd, n_embd)
+        self.out_proj = nn.Linear(n_embd, n_embd)
+        self.dropout = nn.Dropout(dropout)
+        
+        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+        
+    def forward(self, x):
+        B, T, C = x.shape
+        
+        q = self.query(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, nh, T, hs)
+        k = self.key(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)    # (B, nh, T, hs)
+        v = self.value(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, nh, T, hs)
+        
+        # Apply sliding window attention
+        att_scores = (q @ k.transpose(-2, -1)) / (self.head_dim ** 0.5)  # (B, nh, T, T)
+        
+        # Create sliding window mask
+        window_mask = torch.zeros_like(att_scores)
+        for i in range(T):
+            start = max(0, i - self.window_size)
+            end = min(T, i + 1)
+            window_mask[:, :, i, start:end] = 1
+        
+        # Combine with causal mask
+        causal_mask = self.tril[:T, :T].unsqueeze(0).unsqueeze(0)
+        mask = window_mask * causal_mask
+        
+        att_scores = att_scores.masked_fill(mask == 0, float('-inf'))
+        att_probs = F.softmax(att_scores, dim=-1)
+        att_probs = self.dropout(att_probs)
+        
+        out = att_probs @ v  # (B, nh, T, hs)
+        out = out.transpose(1, 2).contiguous().view(B, T, C)  # (B, T, C)
+        
+        return self.out_proj(out)
+
+# Cosine Learning Rate Scheduler with Warmup
+class CosineWarmupScheduler:
+    def __init__(self, optimizer, warmup_steps, max_steps, max_lr, min_lr=0.0):
+        self.optimizer = optimizer
+        self.warmup_steps = warmup_steps
+        self.max_steps = max_steps
+        self.max_lr = max_lr
+        self.min_lr = min_lr
+        self.current_step = 0
+        
+    def step(self):
+        self.current_step += 1
+        if self.current_step < self.warmup_steps:
+            # Linear warmup
+            lr = self.max_lr * (self.current_step / self.warmup_steps)
+        else:
+            # Cosine decay
+            progress = (self.current_step - self.warmup_steps) / (self.max_steps - self.warmup_steps)
+            progress = min(progress, 1.0)
+            lr = self.min_lr + 0.5 * (self.max_lr - self.min_lr) * (1 + torch.cos(torch.tensor(progress * 3.14159)).item())
+            
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+        return lr
+
 # Block with optional MoE and attention type selection
 class Block(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
+        # Primary attention mechanism
         if config.attention_type == "grouped_query":
             assert config.n_query_groups is not None, "n_query_groups must be set for grouped_query attention"
             self.sa = GroupedQueryAttention(config.n_embd, config.n_head, config.n_query_groups, config.dropout, config.block_size)
         else:
             self.sa = MultiHeadAttention(config.n_embd, config.n_head, config.dropout, config.block_size)
+        
+        # Add sliding window attention for long-range dependencies
+        self.sliding_attention = SlidingWindowAttention(config.n_embd, config.n_head, dropout=config.dropout, block_size=config.block_size)
+        
+        # Rotary positional embedding
+        self.rope = RotaryEmbedding(config.n_embd // config.n_head)
+        
+        # Feed forward network
         self.ff = FeedForward(config.n_embd, config.dropout)
+        
+        # Enhanced MoE implementation
         self.use_moe = config.use_moe
         if self.use_moe:
-            self.moe = MoE(config.n_embd, 4*config.n_embd, num_experts=config.moe_num_experts, k=config.moe_k, dropout=config.dropout)
+            # Use sparse MoE for better efficiency
+            self.sparse_moe = SparseExpertLayer(config.n_embd, num_experts=config.moe_num_experts, 
+                                              num_active=config.moe_k, dropout=config.dropout)
+            self.ln3 = nn.LayerNorm(config.n_embd)
+        
+        # Layer norms
         self.ln1 = nn.LayerNorm(config.n_embd)
         self.ln2 = nn.LayerNorm(config.n_embd)
-        self.ln3 = nn.LayerNorm(config.n_embd) if self.use_moe else None
+        self.ln4 = nn.LayerNorm(config.n_embd)  # For sliding window attention
 
     def forward(self, x):
-        x = x + self.sa(self.ln1(x))
+        B, T, C = x.shape
+        
+        # Apply RoPE to input
+        x_rope = self.rope(self.ln1(x), T)
+        
+        # Primary attention with RoPE
+        x = x + self.sa(x_rope)
+        
+        # Sliding window attention for additional context
+        x = x + self.sliding_attention(self.ln4(x))
+        
+        # Feed forward
         x = x + self.ff(self.ln2(x))
+        
+        # Sparse MoE if enabled
         if self.use_moe:
-            x = x + self.moe(self.ln3(x))
+            x = x + self.sparse_moe(self.ln3(x))
+            
         return x
 
-# GPTLanguageModel updated to pass attention_type and n_query_groups
+# GPTLanguageModel updated with gradient checkpointing and enhanced features
 class GPTLanguageModel(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
@@ -229,7 +496,18 @@ class GPTLanguageModel(nn.Module):
         self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layer)])
         self.ln_f = nn.LayerNorm(config.n_embd)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size)
+        
+        # Gradient checkpointing for VRAM optimization
+        self.use_gradient_checkpointing = getattr(config, 'use_gradient_checkpointing', False)
+        
         self.apply(self._init_weights)
+        
+        # Print model information
+        total_params = sum(p.numel() for p in self.parameters())
+        print(f"GPT Model initialized with {total_params:,} parameters")
+        print(f"Estimated VRAM usage: ~{total_params * 4 / (1024**3):.1f}GB")
+        if self.use_gradient_checkpointing:
+            print("Gradient checkpointing enabled for VRAM optimization")
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -244,8 +522,17 @@ class GPTLanguageModel(nn.Module):
         tok = self.token_emb(idx)
         pos = self.pos_emb(torch.arange(T, device=idx.device))
         x = tok + pos
-        x = self.blocks(x)
+        
+        # Apply gradient checkpointing if enabled
+        if self.use_gradient_checkpointing and self.training:
+            # Use checkpoint for each block to save memory
+            for block in self.blocks:
+                x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
+        else:
+            x = self.blocks(x)
+            
         logits = self.lm_head(self.ln_f(x))
+        
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
             return logits, loss
@@ -404,12 +691,8 @@ class GPTLanguageModel(nn.Module):
         best_sequences = []
         for i in range(batch_size):
             beam_start = i * beam_size
-            beam_end = (i + 1) * beam_size
-            # Select the best beam for this batch item
-            local_beam_scores = beam_scores[beam_start:beam_end]
-            local_beams = beams[beam_start:beam_end]
-            best_beam_idx = torch.argmax(local_beam_scores)
-            best_sequences.append(local_beams[best_beam_idx])
+            best_beam_idx = beam_start + torch.argmax(beam_scores[beam_start:beam_start + beam_size])
+            best_sequences.append(beams[best_beam_idx])
         
         return torch.stack(best_sequences)
 
@@ -421,12 +704,19 @@ class Trainer:
         self.scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
         self.loss_callback = loss_callback
         
-        # Add learning rate scheduler
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, 
-            T_max=config.max_iters,
-            eta_min=config.learning_rate * 0.1  # Min LR is 10% of initial
+        # Enhanced learning rate scheduler with cosine warmup
+        self.scheduler = CosineWarmupScheduler(
+            self.optimizer,
+            warmup_steps=config.warmup_iters,
+            max_steps=config.max_iters,
+            max_lr=config.learning_rate,
+            min_lr=config.learning_rate * 0.1
         )
+        
+        # Training metrics tracking
+        self.train_losses = []
+        self.val_losses = []
+        self.learning_rates = []
 
     def train(self, max_iters, plot_step_size=100, stop_event=None, progress_callback=None):
         print(f"Starting training for {max_iters} iterations...")
@@ -438,11 +728,9 @@ class Trainer:
                 print("Training stopped by user.")
                 break
 
-            # Learning rate warmup
-            if it < self.config.warmup_iters:
-                lr = self.config.learning_rate * (it + 1) / self.config.warmup_iters
-                for param_group in self.optimizer.param_groups:
-                    param_group['lr'] = lr
+            # Update learning rate with cosine warmup scheduler
+            current_lr = self.scheduler.step()
+            self.learning_rates.append(current_lr)
 
             xb, yb = get_batch(self.config)
             self.optimizer.zero_grad()
@@ -452,9 +740,9 @@ class Trainer:
                     _, loss = self.model(xb, yb)
                 self.scaler.scale(loss).backward()
                 
-                # Gradient clipping
+                # Enhanced gradient clipping
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
                 
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
@@ -462,17 +750,13 @@ class Trainer:
                 _, loss = self.model(xb, yb)
                 loss.backward()
                 
-                # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+                # Enhanced gradient clipping
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
                 
                 self.optimizer.step()
-
-            # Update learning rate scheduler (after warmup)
-            if it >= self.config.warmup_iters:
-                self.scheduler.step()
             
-            current_lr = self.optimizer.param_groups[0]['lr']
             running_loss += loss.item()
+            self.train_losses.append(loss.item())
 
             if it % plot_step_size == 0 or it == max_iters - 1:
                 avg_loss = running_loss / (plot_step_size if it > 0 else 1)
@@ -517,29 +801,75 @@ class Trainer:
         self.model.train()
         return avg_loss, perplexity
 
-    def save_model(self, filepath="gpt_model.pth"):
-        """Enhanced model saving with metadata"""
+    def save_model(self, filepath="gpt_model.pth", iteration=None, train_loss=None, val_loss=None):
+        """Enhanced model saving with comprehensive metadata"""
         try:
+            # Calculate model statistics
+            total_params = sum(p.numel() for p in self.model.parameters())
+            trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            
+            # Current learning rate
+            current_lr = self.optimizer.param_groups[0]['lr'] if self.optimizer.param_groups else None
+            
             checkpoint = {
                 'model_state_dict': self.model.state_dict(),
                 'optimizer_state_dict': self.optimizer.state_dict(),
+                'scheduler_state_dict': getattr(self.scheduler, 'state_dict', lambda: {})(),
                 'config': asdict(self.config),
+                'training_metadata': {
+                    'iteration': iteration,
+                    'train_loss': train_loss,
+                    'val_loss': val_loss,
+                    'current_lr': current_lr,
+                    'device': str(device),
+                    'torch_version': torch.__version__
+                },
                 'model_info': {
-                    'total_params': sum(p.numel() for p in self.model.parameters()),
-                    'trainable_params': sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+                    'total_params': total_params,
+                    'trainable_params': trainable_params,
+                    'model_size_mb': total_params * 4 / (1024**2),  # Assuming float32
+                    'vocab_size': self.config.vocab_size,
+                    'context_length': self.config.block_size
+                },
+                'training_history': {
+                    'train_losses': self.train_losses[-100:] if len(self.train_losses) > 100 else self.train_losses,
+                    'val_losses': self.val_losses[-100:] if len(self.val_losses) > 100 else self.val_losses,
+                    'learning_rates': self.learning_rates[-100:] if len(self.learning_rates) > 100 else self.learning_rates
                 }
             }
             torch.save(checkpoint, filepath)
-            print(f"Model saved to {filepath}")
+            print(f"Enhanced checkpoint saved to {filepath}")
+            print(f"  - Model: {total_params:,} parameters ({total_params * 4 / (1024**2):.1f} MB)")
+            print(f"  - Iteration: {iteration}, LR: {current_lr:.2e}")
+            if train_loss is not None:
+                print(f"  - Train Loss: {train_loss:.4f}")
+            if val_loss is not None:
+                print(f"  - Val Loss: {val_loss:.4f}, Perplexity: {torch.exp(torch.tensor(val_loss)):.2f}")
             return True
         except Exception as e:
-            print(f"Error saving model: {e}")
+            print(f"Error saving enhanced checkpoint: {e}")
             return False
 
     def load_model(self, filepath="gpt_model.pth"):
-        """Enhanced model loading"""
+        """Enhanced model loading with metadata validation"""
         try:
             checkpoint = torch.load(filepath, map_location=device)
+            
+            # Display checkpoint info
+            if 'training_metadata' in checkpoint:
+                metadata = checkpoint['training_metadata']
+                print(f"Loading checkpoint from iteration {metadata.get('iteration', 'unknown')}")
+                print(f"  - Training device: {metadata.get('device', 'unknown')}")
+                print(f"  - PyTorch version: {metadata.get('torch_version', 'unknown')}")
+                if 'train_loss' in metadata and metadata['train_loss']:
+                    print(f"  - Last train loss: {metadata['train_loss']:.4f}")
+                if 'val_loss' in metadata and metadata['val_loss']:
+                    print(f"  - Last val loss: {metadata['val_loss']:.4f}")
+            
+            if 'model_info' in checkpoint:
+                info = checkpoint['model_info']
+                print(f"  - Model: {info.get('total_params', 'unknown'):,} parameters")
+                print(f"  - Size: {info.get('model_size_mb', 'unknown')} MB")
             
             # Load model state
             if 'model_state_dict' in checkpoint:

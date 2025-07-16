@@ -52,6 +52,26 @@ class GPT_GUI:
         
         self.config = load_config()
         self.config.vocab_size = vocab_size # Set correct vocab size
+        
+        # Apply VRAM optimization based on available GPU memory
+        try:
+            if torch.cuda.is_available():
+                gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # GB
+                if gpu_memory < 20:
+                    vram_profile = "low"
+                elif gpu_memory < 50:
+                    vram_profile = "medium"
+                else:
+                    vram_profile = "high"
+                
+                print(f"Detected {gpu_memory:.1f}GB GPU memory, applying {vram_profile} VRAM profile")
+                self.config = Config.get_vram_optimized_config(vram_profile, self.config)
+            else:
+                print("No CUDA available, using CPU with low profile")
+                self.config = Config.get_vram_optimized_config("low", self.config)
+        except Exception as e:
+            print(f"Error detecting GPU memory, using default config: {e}")
+        
         self.trainer = Trainer(self.config, loss_callback=self.queue_loss)
 
         # Create status bar first, as other methods may use it.
@@ -70,6 +90,7 @@ class GPT_GUI:
         self.create_generation_tab()
         self.create_training_tab()
         self.create_hyperparameter_tab()
+        self.create_advanced_tab()
 
         self.root.after(100, self.process_loss_queue)
 
@@ -449,11 +470,45 @@ https://github.com/DatGuyShorty/DGS-GPT"""
         self.output_text.pack(pady=5, fill="both", expand=True)
 
     def create_training_tab(self):
-        train_frame = ttk.Frame(self.notebook, padding="10")
-        self.notebook.add(train_frame, text='Training')
+        tab = self.training_tab
+        
+        # Title and version info
+        title_frame = tk.Frame(tab)
+        title_frame.pack(fill='x', padx=10, pady=5)
+        
+        title_label = tk.Label(title_frame, text=f"DGS-GPT v{__version__}", font=("Arial", 16, "bold"))
+        title_label.pack(side='left')
+        
+        version_info = get_version_info()
+        info_label = tk.Label(title_frame, text=f"Build: {version_info['build_number']}", font=("Arial", 8))
+        info_label.pack(side='right')
+        
+        # VRAM Profile Selection (NEW)
+        vram_frame = tk.LabelFrame(tab, text="VRAM Optimization", padx=10, pady=5)
+        vram_frame.pack(fill='x', padx=10, pady=5)
+        
+        tk.Label(vram_frame, text="GPU Memory Profile:", font=("Arial", 10, "bold")).pack(anchor='w', pady=2)
+        
+        self.vram_profile_var = tk.StringVar(value="low")
+        vram_options = [
+            ("Low (15GB) - Conservative settings", "low"),
+            ("Medium (40GB) - Standard settings", "medium"),
+            ("High (100GB+) - Expanded settings", "high")
+        ]
+        
+        for text, value in vram_options:
+            tk.Radiobutton(vram_frame, text=text, variable=self.vram_profile_var, 
+                          value=value, command=self.on_vram_profile_change).pack(anchor='w', padx=20)
+        
+        # VRAM info display
+        self.vram_info_label = tk.Label(vram_frame, text="", font=("Arial", 8), fg="blue")
+        self.vram_info_label.pack(anchor='w', padx=20, pady=2)
+        
+        # Initialize VRAM profile info
+        self.on_vram_profile_change()
 
         # Controls frame with evaluation
-        controls_frame = tk.Frame(train_frame)
+        controls_frame = tk.Frame(tab)
         controls_frame.pack(fill='x', pady=5)
         
         # First row - main controls
@@ -493,11 +548,11 @@ https://github.com/DatGuyShorty/DGS-GPT"""
         self.eval_results_label.pack(side='left', padx=20)
 
         # Progress bar
-        self.progress_bar = ttk.Progressbar(train_frame, orient='horizontal', mode='determinate')
+        self.progress_bar = ttk.Progressbar(tab, orient='horizontal', mode='determinate')
         self.progress_bar.pack(fill='x', pady=5)
 
         # Current hyperparameters display
-        hyperparam_display_frame = tk.LabelFrame(train_frame, text="Current Hyperparameters", padx=10, pady=5)
+        hyperparam_display_frame = tk.LabelFrame(tab, text="Current Hyperparameters", padx=10, pady=5)
         hyperparam_display_frame.pack(fill='x', pady=5)
         
         self.hyperparam_text = scrolledtext.ScrolledText(hyperparam_display_frame, height=8, wrap=tk.WORD, state="disabled")
@@ -511,7 +566,7 @@ https://github.com/DatGuyShorty/DGS-GPT"""
         self.ax.set_ylabel("Loss")
         self.line, = self.ax.plot([], [], 'r-')
 
-        self.canvas = FigureCanvasTkAgg(self.fig, master=train_frame)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=tab)
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
@@ -1244,7 +1299,219 @@ Attention Type: {self.config.attention_type}"""
         self.status_text.set(f"Evaluation complete. Perplexity: {perplexity:.2f}")
         self.eval_button.config(state="normal")
 
-if __name__ == "__main__":
-    root = tk.Tk()
-    app = GPT_GUI(root)
-    root.mainloop()
+    def on_vram_profile_change(self):
+        """Handle VRAM profile selection changes"""
+        profile = self.vram_profile_var.get()
+        
+        if profile == "low":
+            info_text = "15GB VRAM: batch_size=2, context=512, layers=4, embedding=1024"
+        elif profile == "medium":
+            info_text = "40GB VRAM: batch_size=16, context=8192, layers=32, embedding=4096"
+        elif profile == "high":
+            info_text = "100GB+ VRAM: batch_size=32, context=16384, layers=40, embedding=5120"
+        else:
+            info_text = ""
+            
+        self.vram_info_label.config(text=info_text)
+        
+        # Update config if trainer exists
+        if hasattr(self, 'trainer') and self.trainer:
+            try:
+                # Apply VRAM optimized config
+                new_config = Config.get_vram_optimized_config(profile, self.config)
+                self.config = new_config
+                
+                # Recreate trainer with new config
+                self.trainer = Trainer(self.config, self.queue_loss)
+                
+                # Update displays
+                self.update_hyperparameter_display()
+                
+                print(f"Applied {profile.upper()} VRAM profile")
+            except Exception as e:
+                print(f"Error applying VRAM profile: {e}")
+
+    def create_advanced_tab(self):
+        """Create advanced settings tab with notebook-inspired features"""
+        tab = tk.Frame(self.notebook)
+        self.notebook.add(tab, text="Advanced")
+        
+        # Create scrollable frame
+        canvas = tk.Canvas(tab)
+        scrollbar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # Advanced Architecture Settings
+        arch_frame = tk.LabelFrame(scrollable_frame, text="Advanced Architecture", padx=10, pady=5)
+        arch_frame.pack(fill='x', pady=5)
+        
+        # RoPE Settings
+        rope_frame = tk.Frame(arch_frame)
+        rope_frame.pack(fill='x', pady=2)
+        
+        self.use_rope_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(rope_frame, text="Use Rotary Positional Embedding (RoPE)", 
+                      variable=self.use_rope_var).pack(side='left', padx=5)
+        
+        # Sliding Window Attention
+        sliding_frame = tk.Frame(arch_frame)
+        sliding_frame.pack(fill='x', pady=2)
+        
+        self.use_sliding_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(sliding_frame, text="Use Sliding Window Attention", 
+                      variable=self.use_sliding_var).pack(side='left', padx=5)
+        
+        tk.Label(sliding_frame, text="Window Size:").pack(side='left', padx=(20,5))
+        self.sliding_window_entry = tk.Entry(sliding_frame, width=8)
+        self.sliding_window_entry.insert(0, "256")
+        self.sliding_window_entry.pack(side='left', padx=5)
+        
+        # Sparse MoE Settings
+        sparse_moe_frame = tk.Frame(arch_frame)
+        sparse_moe_frame.pack(fill='x', pady=2)
+        
+        self.use_sparse_moe_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(sparse_moe_frame, text="Use Sparse Mixture of Experts", 
+                      variable=self.use_sparse_moe_var).pack(side='left', padx=5)
+        
+        tk.Label(sparse_moe_frame, text="Capacity Factor:").pack(side='left', padx=(20,5))
+        self.capacity_factor_entry = tk.Entry(sparse_moe_frame, width=8)
+        self.capacity_factor_entry.insert(0, "1.2")
+        self.capacity_factor_entry.pack(side='left', padx=5)
+        
+        # Training Optimizations
+        training_frame = tk.LabelFrame(scrollable_frame, text="Training Optimizations", padx=10, pady=5)
+        training_frame.pack(fill='x', pady=5)
+        
+        # Gradient Checkpointing
+        checkpoint_frame = tk.Frame(training_frame)
+        checkpoint_frame.pack(fill='x', pady=2)
+        
+        self.use_checkpointing_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(checkpoint_frame, text="Enable Gradient Checkpointing (VRAM optimization)", 
+                      variable=self.use_checkpointing_var).pack(side='left', padx=5)
+        
+        # Enhanced Scheduler Settings
+        scheduler_frame = tk.Frame(training_frame)
+        scheduler_frame.pack(fill='x', pady=2)
+        
+        self.use_cosine_scheduler_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(scheduler_frame, text="Use Cosine Warmup Scheduler", 
+                      variable=self.use_cosine_scheduler_var).pack(side='left', padx=5)
+        
+        # Warmup settings
+        warmup_frame = tk.Frame(training_frame)
+        warmup_frame.pack(fill='x', pady=2)
+        
+        tk.Label(warmup_frame, text="Warmup Steps:").pack(side='left', padx=5)
+        self.warmup_steps_entry = tk.Entry(warmup_frame, width=8)
+        self.warmup_steps_entry.insert(0, "1000")
+        self.warmup_steps_entry.pack(side='left', padx=5)
+        
+        tk.Label(warmup_frame, text="Min LR Ratio:").pack(side='left', padx=(20,5))
+        self.min_lr_ratio_entry = tk.Entry(warmup_frame, width=8)
+        self.min_lr_ratio_entry.insert(0, "0.1")
+        self.min_lr_ratio_entry.pack(side='left', padx=5)
+        
+        # Enhanced Checkpointing
+        checkpoint_settings_frame = tk.LabelFrame(scrollable_frame, text="Enhanced Checkpointing", padx=10, pady=5)
+        checkpoint_settings_frame.pack(fill='x', pady=5)
+        
+        # Auto-save settings
+        autosave_frame = tk.Frame(checkpoint_settings_frame)
+        autosave_frame.pack(fill='x', pady=2)
+        
+        self.auto_save_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(autosave_frame, text="Auto-save with metadata", 
+                      variable=self.auto_save_var).pack(side='left', padx=5)
+        
+        tk.Label(autosave_frame, text="Save every:").pack(side='left', padx=(20,5))
+        self.save_interval_entry = tk.Entry(autosave_frame, width=8)
+        self.save_interval_entry.insert(0, "1000")
+        self.save_interval_entry.pack(side='left', padx=5)
+        tk.Label(autosave_frame, text="iterations").pack(side='left', padx=2)
+        
+        # Perplexity Evaluation
+        eval_frame = tk.LabelFrame(scrollable_frame, text="Model Evaluation", padx=10, pady=5)
+        eval_frame.pack(fill='x', pady=5)
+        
+        # Auto evaluation
+        auto_eval_frame = tk.Frame(eval_frame)
+        auto_eval_frame.pack(fill='x', pady=2)
+        
+        self.auto_eval_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(auto_eval_frame, text="Auto-evaluate perplexity", 
+                      variable=self.auto_eval_var).pack(side='left', padx=5)
+        
+        tk.Label(auto_eval_frame, text="Eval every:").pack(side='left', padx=(20,5))
+        self.eval_interval_entry = tk.Entry(auto_eval_frame, width=8)
+        self.eval_interval_entry.insert(0, "500")
+        self.eval_interval_entry.pack(side='left', padx=5)
+        tk.Label(auto_eval_frame, text="iterations").pack(side='left', padx=2)
+        
+        # Manual evaluation
+        manual_eval_frame = tk.Frame(eval_frame)
+        manual_eval_frame.pack(fill='x', pady=2)
+        
+        tk.Button(manual_eval_frame, text="Calculate Perplexity", 
+                 command=self.calculate_perplexity_manual).pack(side='left', padx=5)
+        
+        self.perplexity_result_label = tk.Label(manual_eval_frame, text="Perplexity: --", 
+                                               font=("Arial", 10))
+        self.perplexity_result_label.pack(side='left', padx=20)
+        
+        # Apply settings button
+        apply_frame = tk.Frame(scrollable_frame)
+        apply_frame.pack(fill='x', pady=10)
+        
+        tk.Button(apply_frame, text="Apply Advanced Settings", 
+                 command=self.apply_advanced_settings, bg="lightgreen").pack(pady=5)
+        
+        # Pack canvas and scrollbar
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+    def apply_advanced_settings(self):
+        """Apply advanced settings to the model configuration"""
+        try:
+            # Update config with advanced settings
+            self.config.use_gradient_checkpointing = self.use_checkpointing_var.get()
+            self.config.warmup_iters = int(self.warmup_steps_entry.get())
+            
+            # Create new trainer with updated config
+            self.trainer = Trainer(self.config, self.queue_loss)
+            
+            # Update displays
+            self.update_hyperparameter_display()
+            
+            messagebox.showinfo("Success", "Advanced settings applied successfully!")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to apply advanced settings: {e}")
+
+    def calculate_perplexity_manual(self):
+        """Manually calculate and display perplexity"""
+        if not hasattr(self, 'trainer') or not self.trainer:
+            messagebox.showwarning("Warning", "Please initialize the trainer first")
+            return
+            
+        try:
+            self.perplexity_result_label.config(text="Calculating...")
+            self.root.update()
+            
+            avg_loss, perplexity = self.trainer.evaluate(eval_iters=100)
+            self.perplexity_result_label.config(text=f"Perplexity: {perplexity:.2f}")
+            
+        except Exception as e:
+            self.perplexity_result_label.config(text="Error calculating")
+            messagebox.showerror("Error", f"Failed to calculate perplexity: {e}")
+
+    # ...existing methods...
