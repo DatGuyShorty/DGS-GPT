@@ -7,6 +7,13 @@ optuna>=3.0.0
 # Dataset handling
 datasets
 
+# Performance monitoring
+psutil
+pandas
+
+# Optional: GPU monitoring (for advanced performance metrics)
+# pynvml  # Uncomment for NVIDIA GPU utilization monitoring
+
 # Development and build tools (for PyTorch compilation)
 setuptools>=40.8.0
 wheel
@@ -25,6 +32,9 @@ wheel
 # time - Time-related functions (included with Python)
 # gc - Garbage collection (included with Python)
 # dataclasses - Data classes (included with Python 3.7+)
+# typing - Type hints (included with Python 3.5+)
+# logging - Logging framework (included with Python)
+# warnings - Warning control (included with Python)
 
 # Removed packages:
 # - tqdm: Not actually used in the codebase

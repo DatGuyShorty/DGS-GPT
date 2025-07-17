@@ -5,10 +5,32 @@ import torch
 import os
 import queue
 import sys
+import re
+import math
+import datetime
+import json
 
 # Matplotlib for plotting
+import matplotlib
+matplotlib.use('TkAgg')  # Ensure TkAgg backend for better tkinter integration
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import matplotlib.pyplot as plt
+# Set a clean plotting style with anti-aliasing (with fallback)
+try:
+    plt.style.use('seaborn-v0_8-whitegrid')
+except OSError:
+    try:
+        plt.style.use('seaborn-whitegrid')
+    except OSError:
+        pass  # Use default style if seaborn styles not available
+
+# Configure matplotlib for smoother plots
+matplotlib.rcParams['lines.antialiased'] = True
+matplotlib.rcParams['text.antialiased'] = True
+matplotlib.rcParams['axes.linewidth'] = 0.8
+matplotlib.rcParams['lines.linewidth'] = 1.5
+matplotlib.rcParams['patch.antialiased'] = True
 
 # Import necessary components from ShitGPT
 try:
@@ -21,7 +43,10 @@ try:
         encode,
         decode,
         device,
-        vocab_size
+        vocab_size,
+        get_training_speed_config,
+        optimize_for_training_speed,
+        clear_cache_and_optimize
     )
     from version import __version__, get_version_info
 except ImportError as e:
@@ -44,8 +69,20 @@ class GPT_GUI:
         self.root.geometry("800x750")
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
+        # Initialize settings file path
+        self.settings_file = "gui_settings.json"
+        
+        # Prevent VRAM profile changes during initialization
+        self._initializing = True
+        self._updating_vram_profile = False
+        self._last_working_profile = "low"
+        
         self.loss_queue = queue.Queue()
         self.losses = []
+        self.perplexities = []
+        self.iterations = []
+        self.learning_rates = []
+        self.grad_norms = []
         self.stop_training_event = None
         self.optim_queue = None
         self.stop_optimization_event = None
@@ -72,7 +109,7 @@ class GPT_GUI:
         except Exception as e:
             print(f"Error detecting GPU memory, using default config: {e}")
         
-        self.trainer = Trainer(self.config, loss_callback=self.queue_loss)
+        self.trainer = Trainer(self.config, loss_callback=self.queue_loss, metrics_callback=self.queue_metrics)
 
         # Create status bar first, as other methods may use it.
         self.status_text = tk.StringVar()
@@ -89,8 +126,18 @@ class GPT_GUI:
 
         self.create_generation_tab()
         self.create_training_tab()
-        self.create_hyperparameter_tab()
+        self.create_model_settings_tab()  # Combined VRAM and hyperparameters
         self.create_advanced_tab()
+
+        # Load persistent settings after creating all GUI components
+        self.load_gui_settings()
+
+        # Mark initialization as complete - VRAM profile changes now allowed
+        self._initializing = False
+        
+        # Store the current working profile
+        if hasattr(self, 'vram_profile_var'):
+            self._last_working_profile = self.vram_profile_var.get()
 
         self.root.after(100, self.process_loss_queue)
 
@@ -101,6 +148,13 @@ class GPT_GUI:
         file_menu.add_command(label="Save Model", command=self.save_model)
         file_menu.add_command(label="Load Model", command=self.load_model)
         file_menu.add_separator()
+        file_menu.add_command(label="Save Hyperparameters", command=self.save_hyperparameters)
+        file_menu.add_command(label="Load Hyperparameters", command=self.load_hyperparameters)
+        file_menu.add_command(label="Apply Current Hyperparameters", command=self.apply_hyperparameters)
+        file_menu.add_separator()
+        file_menu.add_command(label="Export Settings", command=self.export_settings)
+        file_menu.add_command(label="Import Settings", command=self.import_settings)
+        file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.on_closing)
         menubar.add_cascade(label="File", menu=file_menu)
 
@@ -110,6 +164,561 @@ class GPT_GUI:
 
         self.root.config(menu=menubar)
 
+    def save_hyperparameters(self):
+        """Save current hyperparameters to a JSON file"""
+        filepath = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            title="Save Hyperparameters As"
+        )
+        if filepath:
+            try:
+                hyperparams = {
+                    'learning_rate': self.config.learning_rate,
+                    'weight_decay': self.config.weight_decay,
+                    'n_embd': self.config.n_embd,
+                    'n_layer': self.config.n_layer,
+                    'n_head': self.config.n_head,
+                    'block_size': self.config.block_size,
+                    'batch_size': self.config.batch_size,
+                    'dropout': self.config.dropout,
+                    'attention_type': self.config.attention_type,
+                    'n_query_groups': self.config.n_query_groups,
+                    'use_moe': self.config.use_moe,
+                    'moe_num_experts': self.config.moe_num_experts,
+                    'moe_k': self.config.moe_k,
+                    'vram_profile': getattr(self.config, 'vram_profile', 'low'),
+                    'use_gradient_checkpointing': getattr(self.config, 'use_gradient_checkpointing', True),
+                    'warmup_iters': self.config.warmup_iters,
+                    'grad_clip': self.config.grad_clip,
+                    'max_iters': self.config.max_iters
+                }
+                
+                with open(filepath, 'w') as f:
+                    json.dump(hyperparams, f, indent=4)
+                
+                messagebox.showinfo("Success", f"Hyperparameters saved to {os.path.basename(filepath)}")
+                self.status_text.set(f"Hyperparameters saved to {os.path.basename(filepath)}")
+            except Exception as e:
+                messagebox.showerror("Save Error", f"Failed to save hyperparameters:\n{e}")
+
+    def load_hyperparameters(self):
+        """Load hyperparameters from a JSON file"""
+        filepath = filedialog.askopenfilename(
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            title="Load Hyperparameters"
+        )
+        if filepath and os.path.exists(filepath):
+            try:
+                with open(filepath, 'r') as f:
+                    hyperparams = json.load(f)
+                
+                # Update config with loaded hyperparameters
+                for key, value in hyperparams.items():
+                    if hasattr(self.config, key):
+                        setattr(self.config, key, value)
+                
+                # Update GUI controls with loaded values
+                self.update_gui_from_config()
+                
+                messagebox.showinfo("Success", f"Hyperparameters loaded from {os.path.basename(filepath)}")
+                self.status_text.set(f"Hyperparameters loaded from {os.path.basename(filepath)}")
+                
+                # Ask if user wants to apply the loaded hyperparameters
+                if messagebox.askyesno("Apply Hyperparameters", "Would you like to apply the loaded hyperparameters to the model?"):
+                    self.apply_hyperparameters()
+                    
+            except Exception as e:
+                messagebox.showerror("Load Error", f"Failed to load hyperparameters:\n{e}")
+        elif filepath:
+            messagebox.showerror("File Not Found", f"The file '{filepath}' does not exist.")
+
+    def apply_hyperparameters(self):
+        """Apply current hyperparameters to the model by recreating trainer"""
+        try:
+            # Update config with current GUI values
+            self.update_config_from_gui()
+            
+            # Recreate trainer with updated config
+            old_trainer = self.trainer
+            self.trainer = Trainer(self.config, loss_callback=self.queue_loss, metrics_callback=self.queue_metrics)
+            
+            # Try to transfer model weights if compatible
+            try:
+                if hasattr(old_trainer, 'model') and hasattr(self.trainer, 'model'):
+                    # Check if architectures are compatible
+                    old_state = old_trainer.model.state_dict()
+                    new_state = self.trainer.model.state_dict()
+                    
+                    compatible_keys = []
+                    for key in old_state.keys():
+                        if key in new_state and old_state[key].shape == new_state[key].shape:
+                            compatible_keys.append(key)
+                    
+                    if compatible_keys:
+                        # Transfer compatible weights
+                        transfer_dict = {k: old_state[k] for k in compatible_keys}
+                        self.trainer.model.load_state_dict(transfer_dict, strict=False)
+                        print(f"Transferred {len(compatible_keys)} compatible weight tensors")
+                        
+            except Exception as e:
+                print(f"Warning: Could not transfer model weights: {e}")
+            
+            # Update hyperparameter display
+            self.update_hyperparameter_display()
+            
+            messagebox.showinfo("Success", "Hyperparameters applied successfully!\nModel has been recreated with new settings.")
+            self.status_text.set("Hyperparameters applied to model")
+            
+        except Exception as e:
+            messagebox.showerror("Apply Error", f"Failed to apply hyperparameters:\n{e}")
+
+    def update_gui_from_config(self):
+        """Update GUI controls with values from config"""
+        try:
+            # Update hyperparameter optimization controls (legacy)
+            if hasattr(self, 'lr_fixed_entry'):
+                self.lr_fixed_entry.config(state="normal")
+                self.lr_fixed_entry.delete(0, tk.END)
+                self.lr_fixed_entry.insert(0, str(self.config.learning_rate))
+                
+            if hasattr(self, 'wd_fixed_entry'):
+                self.wd_fixed_entry.config(state="normal")
+                self.wd_fixed_entry.delete(0, tk.END)
+                self.wd_fixed_entry.insert(0, str(self.config.weight_decay))
+                
+            if hasattr(self, 'embd_fixed_entry'):
+                self.embd_fixed_entry.config(state="normal")
+                self.embd_fixed_entry.delete(0, tk.END)
+                self.embd_fixed_entry.insert(0, str(self.config.n_embd))
+                
+            if hasattr(self, 'layers_fixed_entry'):
+                self.layers_fixed_entry.config(state="normal")
+                self.layers_fixed_entry.delete(0, tk.END)
+                self.layers_fixed_entry.insert(0, str(self.config.n_layer))
+                
+            if hasattr(self, 'heads_fixed_entry'):
+                self.heads_fixed_entry.config(state="normal")
+                self.heads_fixed_entry.delete(0, tk.END)
+                self.heads_fixed_entry.insert(0, str(self.config.n_head))
+                
+            if hasattr(self, 'dropout_fixed_entry'):
+                self.dropout_fixed_entry.config(state="normal")
+                self.dropout_fixed_entry.delete(0, tk.END)
+                self.dropout_fixed_entry.insert(0, str(self.config.dropout))
+                
+            if hasattr(self, 'batch_fixed_entry'):
+                self.batch_fixed_entry.config(state="normal")
+                self.batch_fixed_entry.delete(0, tk.END)
+                self.batch_fixed_entry.insert(0, str(self.config.batch_size))
+            
+            # Update unified model settings tab variables
+            if hasattr(self, 'lr_var'):
+                self.lr_var.set(str(self.config.learning_rate))
+            if hasattr(self, 'wd_var'):
+                self.wd_var.set(str(self.config.weight_decay))
+            if hasattr(self, 'dropout_var'):
+                self.dropout_var.set(str(self.config.dropout))
+            if hasattr(self, 'batch_size_var'):
+                self.batch_size_var.set(str(self.config.batch_size))
+            if hasattr(self, 'block_size_var'):
+                self.block_size_var.set(str(self.config.block_size))
+            if hasattr(self, 'embd_dim_var'):
+                self.embd_dim_var.set(str(self.config.n_embd))
+            if hasattr(self, 'layers_var'):
+                self.layers_var.set(str(self.config.n_layer))
+            if hasattr(self, 'heads_var'):
+                self.heads_var.set(str(self.config.n_head))
+            
+            # Update training tab batch size input
+            if hasattr(self, 'batch_size_input'):
+                self.batch_size_input.delete(0, tk.END)
+                self.batch_size_input.insert(0, str(self.config.batch_size))
+                
+            # Log the update if console exists
+            if hasattr(self, 'console_text') and hasattr(self, 'log_to_console'):
+                self.log_to_console(f"Batch size field updated to: {self.config.batch_size}", "DEBUG")
+                self.log_to_console(f"Other config values - layers: {self.config.n_layer}, embedding: {self.config.n_embd}, heads: {self.config.n_head}", "DEBUG")
+            
+            # Update architecture controls
+            if hasattr(self, 'use_moe_var'):
+                self.use_moe_var.set(self.config.use_moe)
+            if hasattr(self, 'moe_experts_var'):
+                self.moe_experts_var.set(str(self.config.moe_num_experts))
+            if hasattr(self, 'moe_k_var'):
+                self.moe_k_var.set(str(self.config.moe_k))
+            if hasattr(self, 'attention_type_var'):
+                self.attention_type_var.set(self.config.attention_type)
+            if hasattr(self, 'query_groups_var'):
+                self.query_groups_var.set(str(self.config.n_query_groups))
+            
+            # Update VRAM profile (avoid recursive calls)
+            if hasattr(self, 'vram_profile_var') and not (hasattr(self, '_updating_vram_profile') and self._updating_vram_profile):
+                vram_profile = getattr(self.config, 'vram_profile', 'low')
+                self.vram_profile_var.set(vram_profile)
+                
+        except Exception as e:
+            # Handle errors gracefully - some GUI components may not exist yet
+            if hasattr(self, 'console_text') and hasattr(self, 'log_to_console'):
+                self.log_to_console(f"Warning: Error updating GUI from config: {str(e)}", "WARNING")
+            else:
+                print(f"Warning: Error updating GUI from config: {str(e)}")
+            if hasattr(self, 'on_param_toggle'):
+                self.on_param_toggle()
+                
+            # Update attention type dependent controls
+            if hasattr(self, 'on_attention_type_change'):
+                self.on_attention_type_change()
+                
+        except Exception as e:
+            print(f"Warning: Error updating GUI from config: {e}")
+
+    def update_config_from_gui(self):
+        """Update config with current GUI values"""
+        try:
+            # Architecture settings
+            if hasattr(self, 'use_moe_var'):
+                self.config.use_moe = self.use_moe_var.get()
+            if hasattr(self, 'moe_experts_var'):
+                self.config.moe_num_experts = int(self.moe_experts_var.get())
+            if hasattr(self, 'moe_k_var'):
+                self.config.moe_k = int(self.moe_k_var.get())
+            if hasattr(self, 'attention_type_var'):
+                self.config.attention_type = self.attention_type_var.get()
+            if hasattr(self, 'query_groups_var'):
+                self.config.n_query_groups = int(self.query_groups_var.get())
+            
+            # VRAM profile
+            if hasattr(self, 'vram_profile_var'):
+                self.config.vram_profile = self.vram_profile_var.get()
+                
+            # Advanced settings
+            if hasattr(self, 'use_checkpointing_var'):
+                self.config.use_gradient_checkpointing = self.use_checkpointing_var.get()
+            if hasattr(self, 'warmup_steps_entry'):
+                try:
+                    self.config.warmup_iters = int(self.warmup_steps_entry.get())
+                except ValueError:
+                    pass
+                    
+        except Exception as e:
+            print(f"Warning: Error updating config from GUI: {e}")
+
+    def save_gui_settings(self):
+        """Save all GUI settings to a JSON file"""
+        try:
+            settings = {
+                'generation_settings': {
+                    'max_tokens': self.max_tokens_entry.get() if hasattr(self, 'max_tokens_entry') else "200",
+                    'temperature': self.temperature_entry.get() if hasattr(self, 'temperature_entry') else "1.0",
+                    'top_k': self.top_k_entry.get() if hasattr(self, 'top_k_entry') else "50",
+                    'top_p': self.top_p_entry.get() if hasattr(self, 'top_p_entry') else "0.9",
+                    'use_top_k': self.use_top_k_var.get() if hasattr(self, 'use_top_k_var') else True,
+                    'use_top_p': self.use_top_p_var.get() if hasattr(self, 'use_top_p_var') else False,
+                    'generation_mode': self.generation_mode.get() if hasattr(self, 'generation_mode') else "standard",
+                    'beam_size': self.beam_size_entry.get() if hasattr(self, 'beam_size_entry') else "4"
+                },
+                'training_settings': {
+                    'iterations': self.iters_input.get() if hasattr(self, 'iters_input') else "1000",
+                    'plot_step': self.plot_step_input.get() if hasattr(self, 'plot_step_input') else "100",
+                    'batch_size': self.batch_size_input.get() if hasattr(self, 'batch_size_input') else str(self.config.batch_size),
+                    'eval_iters': self.eval_iters_input.get() if hasattr(self, 'eval_iters_input') else "100",
+                    'auto_scroll': self.auto_scroll_var.get() if hasattr(self, 'auto_scroll_var') else True,
+                    'vram_profile': self.vram_profile_var.get() if hasattr(self, 'vram_profile_var') else "low"
+                },
+                'optimization_settings': {
+                    'trials': self.trials_input.get() if hasattr(self, 'trials_input') else "10",
+                    'steps_per_trial': self.steps_per_trial_input.get() if hasattr(self, 'steps_per_trial_input') else "100",
+                    'optimize_lr': self.optimize_lr_var.get() if hasattr(self, 'optimize_lr_var') else True,
+                    'optimize_wd': self.optimize_wd_var.get() if hasattr(self, 'optimize_wd_var') else True,
+                    'optimize_embd': self.optimize_embd_var.get() if hasattr(self, 'optimize_embd_var') else True,
+                    'optimize_layers': self.optimize_layers_var.get() if hasattr(self, 'optimize_layers_var') else True,
+                    'optimize_heads': self.optimize_heads_var.get() if hasattr(self, 'optimize_heads_var') else True,
+                    'optimize_dropout': self.optimize_dropout_var.get() if hasattr(self, 'optimize_dropout_var') else True,
+                    'optimize_batch': self.optimize_batch_var.get() if hasattr(self, 'optimize_batch_var') else False,
+                    'sampler': self.sampler_var.get() if hasattr(self, 'sampler_var') else "tpe",
+                    'pruner': self.pruner_var.get() if hasattr(self, 'pruner_var') else "median"
+                },
+                'architecture_settings': {
+                    'use_moe': self.use_moe_var.get() if hasattr(self, 'use_moe_var') else True,
+                    'moe_experts': self.moe_experts_var.get() if hasattr(self, 'moe_experts_var') else "4",
+                    'moe_k': self.moe_k_var.get() if hasattr(self, 'moe_k_var') else "1",
+                    'attention_type': self.attention_type_var.get() if hasattr(self, 'attention_type_var') else "grouped_query",
+                    'query_groups': self.query_groups_var.get() if hasattr(self, 'query_groups_var') else "1"
+                },
+                'advanced_settings': {
+                    'use_checkpointing': self.use_checkpointing_var.get() if hasattr(self, 'use_checkpointing_var') else True,
+                    'warmup_steps': self.warmup_steps_entry.get() if hasattr(self, 'warmup_steps_entry') else "100",
+                    'auto_save': self.auto_save_var.get() if hasattr(self, 'auto_save_var') else True,
+                    'auto_eval': self.auto_eval_var.get() if hasattr(self, 'auto_eval_var') else True
+                }
+            }
+            
+            with open(self.settings_file, 'w') as f:
+                json.dump(settings, f, indent=4)
+                
+        except Exception as e:
+            print(f"Warning: Error saving GUI settings: {e}")
+
+    def load_gui_settings(self):
+        """Load GUI settings from JSON file"""
+        try:
+            if not os.path.exists(self.settings_file):
+                return
+                
+            with open(self.settings_file, 'r') as f:
+                settings = json.load(f)
+            
+            # Load generation settings
+            gen_settings = settings.get('generation_settings', {})
+            if hasattr(self, 'max_tokens_entry'):
+                self.max_tokens_entry.delete(0, tk.END)
+                self.max_tokens_entry.insert(0, gen_settings.get('max_tokens', '200'))
+            if hasattr(self, 'temperature_entry'):
+                self.temperature_entry.delete(0, tk.END)
+                self.temperature_entry.insert(0, gen_settings.get('temperature', '1.0'))
+            if hasattr(self, 'top_k_entry'):
+                self.top_k_entry.delete(0, tk.END)
+                self.top_k_entry.insert(0, gen_settings.get('top_k', '50'))
+            if hasattr(self, 'top_p_entry'):
+                self.top_p_entry.delete(0, tk.END)
+                self.top_p_entry.insert(0, gen_settings.get('top_p', '0.9'))
+            if hasattr(self, 'use_top_k_var'):
+                self.use_top_k_var.set(gen_settings.get('use_top_k', True))
+            if hasattr(self, 'use_top_p_var'):
+                self.use_top_p_var.set(gen_settings.get('use_top_p', False))
+            if hasattr(self, 'generation_mode'):
+                self.generation_mode.set(gen_settings.get('generation_mode', 'standard'))
+            if hasattr(self, 'beam_size_entry'):
+                self.beam_size_entry.delete(0, tk.END)
+                self.beam_size_entry.insert(0, gen_settings.get('beam_size', '4'))
+            
+            # Load training settings
+            train_settings = settings.get('training_settings', {})
+            if hasattr(self, 'iters_input'):
+                self.iters_input.delete(0, tk.END)
+                self.iters_input.insert(0, train_settings.get('iterations', '1000'))
+            if hasattr(self, 'plot_step_input'):
+                self.plot_step_input.delete(0, tk.END)
+                self.plot_step_input.insert(0, train_settings.get('plot_step', '100'))
+            # Load VRAM profile first and apply it
+            if hasattr(self, 'vram_profile_var'):
+                saved_vram_profile = train_settings.get('vram_profile', 'low')
+                self.vram_profile_var.set(saved_vram_profile)
+                # Apply the VRAM profile BEFORE loading other settings so batch size gets set correctly
+                self.on_vram_profile_change()
+                
+            # Load batch size AFTER applying VRAM profile, but only if no VRAM profile was saved
+            # This prevents saved batch size from overriding VRAM profile settings
+            if hasattr(self, 'batch_size_input') and 'vram_profile' not in train_settings:
+                self.batch_size_input.delete(0, tk.END)
+                self.batch_size_input.insert(0, train_settings.get('batch_size', str(self.config.batch_size)))
+            
+            # Load other training settings
+            if hasattr(self, 'eval_iters_input'):
+                self.eval_iters_input.delete(0, tk.END)
+                self.eval_iters_input.insert(0, train_settings.get('eval_iters', '100'))
+            if hasattr(self, 'auto_scroll_var'):
+                self.auto_scroll_var.set(train_settings.get('auto_scroll', True))
+            
+            # Load optimization settings
+            opt_settings = settings.get('optimization_settings', {})
+            if hasattr(self, 'trials_input'):
+                self.trials_input.delete(0, tk.END)
+                self.trials_input.insert(0, opt_settings.get('trials', '10'))
+            if hasattr(self, 'steps_per_trial_input'):
+                self.steps_per_trial_input.delete(0, tk.END)
+                self.steps_per_trial_input.insert(0, opt_settings.get('steps_per_trial', '100'))
+            if hasattr(self, 'optimize_lr_var'):
+                self.optimize_lr_var.set(opt_settings.get('optimize_lr', True))
+            if hasattr(self, 'optimize_wd_var'):
+                self.optimize_wd_var.set(opt_settings.get('optimize_wd', True))
+            if hasattr(self, 'optimize_embd_var'):
+                self.optimize_embd_var.set(opt_settings.get('optimize_embd', True))
+            if hasattr(self, 'optimize_layers_var'):
+                self.optimize_layers_var.set(opt_settings.get('optimize_layers', True))
+            if hasattr(self, 'optimize_heads_var'):
+                self.optimize_heads_var.set(opt_settings.get('optimize_heads', True))
+            if hasattr(self, 'optimize_dropout_var'):
+                self.optimize_dropout_var.set(opt_settings.get('optimize_dropout', True))
+            if hasattr(self, 'optimize_batch_var'):
+                self.optimize_batch_var.set(opt_settings.get('optimize_batch', False))
+            if hasattr(self, 'sampler_var'):
+                self.sampler_var.set(opt_settings.get('sampler', 'tpe'))
+            if hasattr(self, 'pruner_var'):
+                self.pruner_var.set(opt_settings.get('pruner', 'median'))
+            
+            # Load architecture settings
+            arch_settings = settings.get('architecture_settings', {})
+            if hasattr(self, 'use_moe_var'):
+                self.use_moe_var.set(arch_settings.get('use_moe', True))
+            if hasattr(self, 'moe_experts_var'):
+                self.moe_experts_var.set(arch_settings.get('moe_experts', '4'))
+            if hasattr(self, 'moe_k_var'):
+                self.moe_k_var.set(arch_settings.get('moe_k', '1'))
+            if hasattr(self, 'attention_type_var'):
+                self.attention_type_var.set(arch_settings.get('attention_type', 'grouped_query'))
+            if hasattr(self, 'query_groups_var'):
+                self.query_groups_var.set(arch_settings.get('query_groups', '1'))
+            
+            # Load advanced settings
+            adv_settings = settings.get('advanced_settings', {})
+            if hasattr(self, 'use_checkpointing_var'):
+                self.use_checkpointing_var.set(adv_settings.get('use_checkpointing', True))
+            if hasattr(self, 'warmup_steps_entry'):
+                self.warmup_steps_entry.delete(0, tk.END)
+                self.warmup_steps_entry.insert(0, adv_settings.get('warmup_steps', '100'))
+            if hasattr(self, 'auto_save_var'):
+                self.auto_save_var.set(adv_settings.get('auto_save', True))
+            if hasattr(self, 'auto_eval_var'):
+                self.auto_eval_var.set(adv_settings.get('auto_eval', True))
+            
+            # Update dependent controls
+            if hasattr(self, 'on_param_toggle'):
+                self.on_param_toggle()
+            if hasattr(self, 'on_attention_type_change'):
+                self.on_attention_type_change()
+                
+            print("GUI settings loaded successfully")
+            
+        except Exception as e:
+            print(f"Warning: Error loading GUI settings: {e}")
+
+    def export_settings(self):
+        """Export all settings including hyperparameters"""
+        filepath = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            title="Export All Settings As"
+        )
+        if filepath:
+            try:
+                # Update config from GUI first
+                self.update_config_from_gui()
+                
+                settings = {
+                    'hyperparameters': {
+                        'learning_rate': self.config.learning_rate,
+                        'weight_decay': self.config.weight_decay,
+                        'n_embd': self.config.n_embd,
+                        'n_layer': self.config.n_layer,
+                        'n_head': self.config.n_head,
+                        'block_size': self.config.block_size,
+                        'batch_size': self.config.batch_size,
+                        'dropout': self.config.dropout,
+                        'attention_type': self.config.attention_type,
+                        'n_query_groups': self.config.n_query_groups,
+                        'use_moe': self.config.use_moe,
+                        'moe_num_experts': self.config.moe_num_experts,
+                        'moe_k': self.config.moe_k,
+                        'vram_profile': getattr(self.config, 'vram_profile', 'low'),
+                        'use_gradient_checkpointing': getattr(self.config, 'use_gradient_checkpointing', True),
+                        'warmup_iters': self.config.warmup_iters,
+                        'grad_clip': self.config.grad_clip,
+                        'max_iters': self.config.max_iters
+                    },
+                    'gui_settings': {
+                        'generation_settings': {
+                            'max_tokens': self.max_tokens_entry.get(),
+                            'temperature': self.temperature_entry.get(),
+                            'top_k': self.top_k_entry.get(),
+                            'top_p': self.top_p_entry.get(),
+                            'use_top_k': self.use_top_k_var.get(),
+                            'use_top_p': self.use_top_p_var.get(),
+                            'generation_mode': self.generation_mode.get(),
+                            'beam_size': self.beam_size_entry.get()
+                        },
+                        'training_settings': {
+                            'iterations': self.iters_input.get(),
+                            'plot_step': self.plot_step_input.get(),
+                            'eval_iters': self.eval_iters_input.get(),
+                            'auto_scroll': self.auto_scroll_var.get(),
+                            'vram_profile': self.vram_profile_var.get()
+                        },
+                        'optimization_settings': {
+                            'trials': self.trials_input.get(),
+                            'steps_per_trial': self.steps_per_trial_input.get(),
+                            'sampler': self.sampler_var.get(),
+                            'pruner': self.pruner_var.get()
+                        }
+                    },
+                    'export_info': {
+                        'timestamp': datetime.datetime.now().isoformat(),
+                        'version': __version__,
+                        'device': str(device)
+                    }
+                }
+                
+                with open(filepath, 'w') as f:
+                    json.dump(settings, f, indent=4)
+                
+                messagebox.showinfo("Success", f"All settings exported to {os.path.basename(filepath)}")
+                self.status_text.set(f"Settings exported to {os.path.basename(filepath)}")
+                
+            except Exception as e:
+                messagebox.showerror("Export Error", f"Failed to export settings:\n{e}")
+
+    def import_settings(self):
+        """Import all settings including hyperparameters"""
+        filepath = filedialog.askopenfilename(
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            title="Import Settings"
+        )
+        if filepath and os.path.exists(filepath):
+            try:
+                with open(filepath, 'r') as f:
+                    settings = json.load(f)
+                
+                # Load hyperparameters if present
+                if 'hyperparameters' in settings:
+                    hyperparams = settings['hyperparameters']
+                    for key, value in hyperparams.items():
+                        if hasattr(self.config, key):
+                            setattr(self.config, key, value)
+                    self.update_gui_from_config()
+                
+                # Load GUI settings if present
+                if 'gui_settings' in settings:
+                    # Save to temporary settings file and reload
+                    temp_settings = settings['gui_settings']
+                    with open(self.settings_file, 'w') as f:
+                        json.dump(temp_settings, f, indent=4)
+                    self.load_gui_settings()
+                
+                messagebox.showinfo("Success", f"Settings imported from {os.path.basename(filepath)}")
+                self.status_text.set(f"Settings imported from {os.path.basename(filepath)}")
+                
+                # Ask if user wants to apply the imported hyperparameters
+                if 'hyperparameters' in settings:
+                    if messagebox.askyesno("Apply Hyperparameters", "Would you like to apply the imported hyperparameters to the model?"):
+                        self.apply_hyperparameters()
+                
+            except Exception as e:
+                messagebox.showerror("Import Error", f"Failed to import settings:\n{e}")
+        elif filepath:
+            messagebox.showerror("File Not Found", f"The file '{filepath}' does not exist.")
+
+    def cleanup_resources(self):
+        """Cleanup resources and stop all running threads"""
+        try:
+            # Save settings before closing
+            self.save_gui_settings()
+            
+            # Stop training if running
+            if hasattr(self, 'stop_training_event') and self.stop_training_event:
+                self.stop_training_event.set()
+            
+            # Stop optimization if running
+            if hasattr(self, 'stop_optimization_event') and self.stop_optimization_event:
+                self.stop_optimization_event.set()
+            
+            # Clear memory if CUDA is available
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+        except Exception as e:
+            print(f"Warning: Error during cleanup: {e}")
+
     def save_model(self):
         filepath = filedialog.asksaveasfilename(
             defaultextension=".pth",
@@ -117,7 +726,7 @@ class GPT_GUI:
             title="Save Model As"
         )
         if filepath:
-            self.trainer.save_model(filepath)
+            self.trainer.save_model(filepath, verbose=True)
             self.status_text.set(f"Model saved to {os.path.basename(filepath)}")
 
     def load_model(self):
@@ -127,278 +736,29 @@ class GPT_GUI:
         )
         if filepath and os.path.exists(filepath):
             try:
-                # Use strict=False to allow loading partial or different models
-                self.trainer.model.load_state_dict(torch.load(filepath, map_location=device), strict=False)
-                self.status_text.set(f"Model loaded from {os.path.basename(filepath)}")
+                # Use the enhanced model loading method from Trainer
+                success = self.trainer.load_model(filepath)
+                if success:
+                    self.status_text.set(f"Model loaded from {os.path.basename(filepath)}")
+                else:
+                    self.status_text.set("Failed to load model - using current model.")
             except Exception as e:
                 messagebox.showerror("Load Error", f"Failed to load model weights:\n{e}")
                 self.status_text.set("Failed to load model.")
         elif filepath:
             messagebox.showerror("File Not Found", f"The file '{filepath}' does not exist.")
 
-    def start_optimization_thread(self):
-        try:
-            n_trials = int(self.trials_input.get())
-            steps_per_trial = int(self.steps_per_trial_input.get())
-            if n_trials <= 0 or steps_per_trial <= 0:
-                raise ValueError
-        except ValueError:
-            messagebox.showerror("Invalid Input", "Please enter positive integers for trials and steps per trial.")
-            return
-
-        # Get architecture configuration from GUI
-        arch_config = self.get_architecture_config()
-        
-        # Get parameter configuration
-        param_config = self.get_parameter_config()
-        if param_config is None:
-            return  # Error in parameter configuration
-        
-        # Get sampler configuration
-        sampler_config = self.get_sampler_config()
-        
-        # Validate configuration
-        if arch_config.attention_type == 'grouped_query' and arch_config.n_head % arch_config.n_query_groups != 0:
-            messagebox.showerror("Invalid Configuration", 
-                               f"Number of heads ({arch_config.n_head}) must be divisible by query groups ({arch_config.n_query_groups})")
-            return
-
-        self.optimize_button.config(state="disabled")
-        self.stop_optimize_button.config(state="normal")
-        self.train_button.config(state="disabled")
-        self.generate_button.config(state="disabled")
-        
-        # Update status with configuration info
-        moe_info = f" with MoE ({arch_config.moe_num_experts} experts)" if arch_config.use_moe else ""
-        attn_info = f" using {arch_config.attention_type} attention"
-        sampler_info = f" ({sampler_config['type']} sampler)"
-        self.status_text.set(f"Starting optimization: {n_trials} trials{moe_info}{attn_info}{sampler_info}")
-        
-        # Clear log
-        self.optim_log_text.config(state="normal")
-        self.optim_log_text.delete("1.0", tk.END)
-        self.optim_log_text.insert(tk.END, f"=== HYPERPARAMETER OPTIMIZATION LOG ===\n")
-        self.optim_log_text.insert(tk.END, f"Configuration: {n_trials} trials, {steps_per_trial} steps per trial\n")
-        self.optim_log_text.insert(tk.END, f"Architecture: {arch_config.attention_type} attention{moe_info}\n")
-        self.optim_log_text.insert(tk.END, f"Sampler: {sampler_config['type']}, Pruner: {sampler_config['pruner']}\n")
-        
-        # Add pruner parameter details
-        pruner_type = sampler_config['pruner']
-        if pruner_type == 'median':
-            self.optim_log_text.insert(tk.END, f"  Median Pruner: startup={sampler_config.get('median_startup_trials', 5)}, warmup={sampler_config.get('median_warmup_steps', 10)}, min_trials={sampler_config.get('median_min_trials', 5)}\n")
-        elif pruner_type == 'percentile':
-            self.optim_log_text.insert(tk.END, f"  Percentile Pruner: percentile={sampler_config.get('percentile', 25.0)}%, startup={sampler_config.get('percentile_startup_trials', 5)}, warmup={sampler_config.get('percentile_warmup_steps', 0)}\n")
-        elif pruner_type == 'successive_halving':
-            self.optim_log_text.insert(tk.END, f"  Successive Halving: min_resource={sampler_config.get('halving_min_resource', 1)}, reduction={sampler_config.get('halving_reduction_factor', 4)}, min_early_stop={sampler_config.get('halving_min_early_stopping_rate', 5)}\n")
-        elif pruner_type == 'none':
-            self.optim_log_text.insert(tk.END, f"  No pruning enabled\n")
-        
-        self.optim_log_text.insert(tk.END, f"Device: {device}\n")
-        
-        # Show which parameters are being optimized
-        params_to_optimize = []
-        if param_config.get('optimize_lr', True): params_to_optimize.append("Learning Rate")
-        if param_config.get('optimize_wd', True): params_to_optimize.append("Weight Decay")
-        if param_config.get('optimize_embd', True): params_to_optimize.append("Embedding Dim")
-        if param_config.get('optimize_layers', True): params_to_optimize.append("Layers")
-        if param_config.get('optimize_heads', True): params_to_optimize.append("Heads")
-        if param_config.get('optimize_dropout', True): params_to_optimize.append("Dropout")
-        if param_config.get('optimize_batch', True): params_to_optimize.append("Batch Size")
-        
-        self.optim_log_text.insert(tk.END, f"Optimizing: {', '.join(params_to_optimize)}\n")
-        self.optim_log_text.insert(tk.END, "=" * 50 + "\n\n")
-        self.optim_log_text.config(state="disabled")
-
-        self.optim_progress_bar['value'] = 0
-        self.optim_progress_bar['maximum'] = n_trials
-
-        self.optim_queue = queue.Queue()
-        self.stop_optimization_event = threading.Event()
-        
-        thread = threading.Thread(target=self.run_optimization_thread, args=(n_trials, steps_per_trial, arch_config, param_config, sampler_config))
-        thread.daemon = True
-        thread.start()
-        
-        # Start updating the log display
-        self.root.after(100, self.process_optim_queue)
-
-    def run_optimization_thread(self, n_trials, steps_per_trial, arch_config, param_config, sampler_config):
-        original_stdout = sys.stdout
-        sys.stdout = QueueStream(self.optim_queue)
-
-        try:
-            new_config = run_hyperparameter_optimization(
-                arch_config, n_trials, steps_per_trial, 
-                param_config, self.stop_optimization_event, sampler_config
-            )
-            self.root.after(0, self.on_optimization_complete, new_config)
-        except Exception as e:
-            error_msg = str(e)
-            print(f"\n--- OPTIMIZATION FAILED ---\n{error_msg}")
-            self.root.after(0, lambda msg=error_msg: self.status_text.set(f"Optimization error: {msg}"))
-        finally:
-            sys.stdout = original_stdout
-            self.root.after(0, self.optimization_finished)
-
-    def process_optim_queue(self):
-        updated = False
-        trial_completed = False
-        try:
-            while not self.optim_queue.empty():
-                line = self.optim_queue.get_nowait()
-                self.optim_log_text.config(state='normal')
-                self.optim_log_text.insert(tk.END, line)
-                self.optim_log_text.config(state='disabled')
-                self.optim_log_text.see(tk.END)
-                updated = True
-                
-                # Update progress bar based on trial completion
-                if "Trial #" in line and "completed" in line:
-                    trial_completed = True
-                elif "Trial #" in line and "Starting Trial" in line:
-                    # Extract trial number and update progress
-                    try:
-                        import re
-                        match = re.search(r"Trial #(\d+)", line)
-                        if match:
-                            current_trial = int(match.group(1))
-                            self.optim_progress_bar['value'] = current_trial
-                    except:
-                        pass
-        except:
-            pass
-        
-        if updated:
-            self.root.update_idletasks()
-        
-        # Update progress bar if trial completed
-        if trial_completed:
-            current_value = self.optim_progress_bar['value']
-            if current_value < self.optim_progress_bar['maximum']:
-                self.optim_progress_bar['value'] = current_value + 1
-        
-        # Continue processing if optimization is running
-        if self.optimize_button['state'] == 'disabled':
-            self.root.after(100, self.process_optim_queue)
-
-    def stop_optimization(self):
-        if hasattr(self, 'stop_optimization_event') and self.stop_optimization_event:
-            print("Stop button clicked - setting stop event")
-            self.stop_optimization_event.set()
-            self.stop_optimize_button.config(state="disabled")
-            self.status_text.set("Stopping optimization and saving best parameters...")
-            
-            # Add message to log
-            self.optim_log_text.config(state="normal")
-            self.optim_log_text.insert(tk.END, "\n=== STOP REQUESTED BY USER ===\n")
-            self.optim_log_text.insert(tk.END, "Stopping optimization and saving best parameters found so far...\n")
-            self.optim_log_text.config(state="disabled")
-            self.optim_log_text.see(tk.END)
-
-    def optimization_finished(self):
-        self.optimize_button.config(state="normal")
-        self.stop_optimize_button.config(state="disabled")
-        self.train_button.config(state="normal")
-        self.generate_button.config(state="normal")
-        
-        if hasattr(self, 'stop_optimization_event') and self.stop_optimization_event and self.stop_optimization_event.is_set():
-            self.status_text.set("Optimization stopped by user. Best parameters saved.")
-        else:
-            self.status_text.set("Optimization completed. Best parameters saved.")
-
-    def on_optimization_complete(self, new_config):
-        if hasattr(self, 'stop_optimization_event') and self.stop_optimization_event and self.stop_optimization_event.is_set():
-            messagebox.showinfo("Optimization Stopped", "Hyperparameter optimization was stopped by user. The model has been updated with the best parameters found so far.")
-        else:
-            messagebox.showinfo("Optimization Complete", "Hyperparameter optimization finished. The model has been updated with the best parameters found.")
-        
-        self.config = new_config
-        self.config.vocab_size = vocab_size # Also update vocab size on new config
-        
-        # Update GUI controls with the new configuration
-        self.use_moe_var.set(new_config.use_moe)
-        self.moe_experts_var.set(str(new_config.moe_num_experts))
-        self.moe_k_var.set(str(new_config.moe_k))
-        self.attention_type_var.set(new_config.attention_type)
-        self.query_groups_var.set(str(new_config.n_query_groups))
-        self.on_attention_type_change()  # Update query groups combo state
-        
-        # Update parameter fixed values with optimized results
-        self.lr_fixed_entry.config(state="normal")
-        self.lr_fixed_entry.delete(0, tk.END)
-        self.lr_fixed_entry.insert(0, str(new_config.learning_rate))
-        
-        self.wd_fixed_entry.config(state="normal")
-        self.wd_fixed_entry.delete(0, tk.END)
-        self.wd_fixed_entry.insert(0, str(new_config.weight_decay))
-        
-        self.embd_fixed_entry.config(state="normal")
-        self.embd_fixed_entry.delete(0, tk.END)
-        self.embd_fixed_entry.insert(0, str(new_config.n_embd))
-        
-        self.layers_fixed_entry.config(state="normal")
-        self.layers_fixed_entry.delete(0, tk.END)
-        self.layers_fixed_entry.insert(0, str(new_config.n_layer))
-        
-        self.heads_fixed_entry.config(state="normal")
-        self.heads_fixed_entry.delete(0, tk.END)
-        self.heads_fixed_entry.insert(0, str(new_config.n_head))
-        
-        self.dropout_fixed_entry.config(state="normal")
-        self.dropout_fixed_entry.delete(0, tk.END)
-        self.dropout_fixed_entry.insert(0, str(new_config.dropout))
-        
-        if hasattr(new_config, 'batch_size'):
-            self.batch_fixed_entry.config(state="normal")
-            self.batch_fixed_entry.delete(0, tk.END)
-            self.batch_fixed_entry.insert(0, str(new_config.batch_size))
-        
-        # Restore parameter toggle states
-        self.on_param_toggle()
-        
-        self.trainer = Trainer(self.config, loss_callback=self.queue_loss)
-        self.update_hyperparameter_display()  # Update the display with new hyperparameters
-        self.status_text.set("Model updated with optimized hyperparameters.")
-
-    def show_about(self):
-        """Show about dialog with version information"""
-        version_info = get_version_info()
-        about_text = f"""DGS-GPT v{version_info['version']}
-
-{version_info['description']}
-
-Author: {version_info['author']}
-License: {version_info['license']}
-
-A modern GPT implementation featuring:
-• Advanced transformer architecture
-• Multi-head and grouped query attention
-• Mixture of Experts (MoE) support
-• Real-time training visualization
-• Hyperparameter optimization with Optuna
-• Cross-platform compatibility
-
-For more information, visit:
-https://github.com/DatGuyShorty/DGS-GPT"""
-        
-        messagebox.showinfo("About DGS-GPT", about_text)
-
     def on_closing(self):
-        self.root.destroy()
-
-    def load_model_weights(self):
-        model_path = "gpt_model.pth"
-        if os.path.exists(model_path):
-            try:
-                # Use strict=False to allow loading partial or different models
-                self.trainer.model.load_state_dict(torch.load(model_path, map_location=device), strict=False)
-                self.status_text.set("Model loaded successfully.")
-                return True
-            except Exception as e:
-                messagebox.showwarning("Model Load Error", f"Could not load model weights from {model_path}:\n{e}\n\nUsing a randomly initialized model.")
-        else:
-            messagebox.showwarning("Model Not Found", f"Model file '{model_path}' not found.\nThe model will have random weights and produce gibberish.")
-        return False
+        """Handle application closing with proper cleanup"""
+        try:
+            self.cleanup_resources()
+            # Give threads a moment to stop gracefully
+            import time
+            time.sleep(0.1)
+        except Exception as e:
+            print(f"Warning: Error during shutdown: {e}")
+        finally:
+            self.root.destroy()
 
     def create_generation_tab(self):
         gen_frame = ttk.Frame(self.notebook, padding="10")
@@ -470,7 +830,8 @@ https://github.com/DatGuyShorty/DGS-GPT"""
         self.output_text.pack(pady=5, fill="both", expand=True)
 
     def create_training_tab(self):
-        tab = self.training_tab
+        tab = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(tab, text='Training')
         
         # Title and version info
         title_frame = tk.Frame(tab)
@@ -480,12 +841,220 @@ https://github.com/DatGuyShorty/DGS-GPT"""
         title_label.pack(side='left')
         
         version_info = get_version_info()
-        info_label = tk.Label(title_frame, text=f"Build: {version_info['build_number']}", font=("Arial", 8))
+        # Use a safer approach to get build info
+        build_info = version_info.get('build_number', version_info.get('version', 'Unknown'))
+        info_label = tk.Label(title_frame, text=f"Build: {build_info}", font=("Arial", 8))
         info_label.pack(side='right')
         
-        # VRAM Profile Selection (NEW)
-        vram_frame = tk.LabelFrame(tab, text="VRAM Optimization", padx=10, pady=5)
-        vram_frame.pack(fill='x', padx=10, pady=5)
+        # Create main horizontal container for console (left) and controls/plots (right)
+        main_container = tk.Frame(tab)
+        main_container.pack(fill='both', expand=True, pady=5)
+        
+        # Left side - Console (spanning full height)
+        console_frame = tk.LabelFrame(main_container, text="Training Console", padx=10, pady=5)
+        console_frame.pack(side='left', fill='both', expand=False, padx=(0,5))
+        console_frame.config(width=350)  # Fixed width for console
+        console_frame.pack_propagate(False)  # Prevent resizing based on content
+        
+        # Console controls
+        console_controls = tk.Frame(console_frame)
+        console_controls.pack(fill='x', pady=2)
+        
+        self.auto_scroll_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(console_controls, text="Auto-scroll", variable=self.auto_scroll_var).pack(side='left', padx=5)
+        
+        tk.Button(console_controls, text="Clear Console", command=self.clear_console).pack(side='left', padx=5)
+        
+        tk.Button(console_controls, text="Save Log", command=self.save_console_log).pack(side='left', padx=5)
+        
+        # Console text area (full height)
+        self.console_text = scrolledtext.ScrolledText(console_frame, width=40, wrap=tk.WORD, 
+                                                     bg='black', fg='lime', font=('Consolas', 9))
+        self.console_text.pack(fill='both', expand=True, pady=2)
+        self.console_text.insert(tk.END, "=== DGS-GPT Training Console ===\n")
+        import datetime
+        self.console_text.insert(tk.END, f"Initialized at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        self.console_text.insert(tk.END, f"PyTorch Device: {device}\n")
+        self.console_text.insert(tk.END, "Ready for training...\n\n")
+        self.console_text.config(state='disabled')
+        
+        # Right side - Controls and plots
+        right_container = tk.Frame(main_container)
+        right_container.pack(side='right', fill='both', expand=True)
+        
+        # Controls frame with evaluation
+        controls_frame = tk.Frame(right_container)
+        controls_frame.pack(fill='x', pady=5)
+        
+        # First row - main controls
+        controls_row1 = tk.Frame(controls_frame)
+        controls_row1.pack(fill='x', pady=2)
+        
+        tk.Label(controls_row1, text="Iterations:").pack(side='left', padx=5)
+        self.iters_input = tk.Entry(controls_row1, width=10)
+        self.iters_input.insert(0, "1000")
+        self.iters_input.pack(side='left', padx=5)
+
+        tk.Label(controls_row1, text="Plot Step:").pack(side='left', padx=5)
+        self.plot_step_input = tk.Entry(controls_row1, width=10)
+        self.plot_step_input.insert(0, "100")
+        self.plot_step_input.pack(side='left', padx=5)
+        
+        tk.Label(controls_row1, text="Batch Size:").pack(side='left', padx=5)
+        self.batch_size_input = tk.Entry(controls_row1, width=8)
+        self.batch_size_input.insert(0, str(self.config.batch_size))
+        self.batch_size_input.pack(side='left', padx=5)
+
+        self.train_button = tk.Button(controls_row1, text="Start Training", command=self.start_training_thread)
+        self.train_button.pack(side='left', padx=5)
+
+        self.stop_button = tk.Button(controls_row1, text="Stop Training", command=self.stop_training, state="disabled")
+        self.stop_button.pack(side='left', padx=5)
+        
+        # Second row - evaluation controls
+        controls_row2 = tk.Frame(controls_frame)
+        controls_row2.pack(fill='x', pady=2)
+        
+        self.eval_button = tk.Button(controls_row2, text="Evaluate Model", command=self.evaluate_model)
+        self.eval_button.pack(side='left', padx=5)
+        
+        # Performance optimization controls (NEW)
+        self.speed_config_button = tk.Button(controls_row2, text="🚀 Ultra-Speed Config", 
+                                           command=self.apply_speed_config, 
+                                           bg='orange', fg='white')
+        self.speed_config_button.pack(side='left', padx=5)
+        
+        self.optimize_button = tk.Button(controls_row2, text="⚡ Optimize Now", 
+                                       command=self.optimize_performance,
+                                       bg='green', fg='white')
+        self.optimize_button.pack(side='left', padx=5)
+        
+        self.clear_cache_button = tk.Button(controls_row2, text="🧹 Clear Cache", 
+                                          command=self.clear_performance_cache,
+                                          bg='blue', fg='white')
+        self.clear_cache_button.pack(side='left', padx=5)
+        
+        tk.Label(controls_row2, text="Eval Iters:").pack(side='left', padx=5)
+        self.eval_iters_input = tk.Entry(controls_row2, width=8)
+        self.eval_iters_input.insert(0, "100")
+        self.eval_iters_input.pack(side='left', padx=5)
+        
+        # Evaluation results
+        self.eval_results_label = tk.Label(controls_row2, text="", fg="blue")
+        self.eval_results_label.pack(side='left', padx=20)
+
+        # Progress bar
+        self.progress_bar = ttk.Progressbar(right_container, orient='horizontal', mode='determinate')
+        self.progress_bar.pack(fill='x', pady=5)
+
+        # Current hyperparameters display
+        hyperparam_display_frame = tk.LabelFrame(right_container, text="Current Hyperparameters", padx=10, pady=5)
+        hyperparam_display_frame.pack(fill='x', pady=5)
+        
+        self.hyperparam_text = scrolledtext.ScrolledText(hyperparam_display_frame, height=6, wrap=tk.WORD, state="disabled")
+        self.hyperparam_text.pack(fill='x', pady=5)
+        self.update_hyperparameter_display()
+
+        self.fig = Figure(figsize=(14, 10), dpi=100, facecolor='white')
+        
+        # Initialize smoothing parameters
+        self.smoothing_window = 10
+        self.max_perplexity_display = 500  # Cap perplexity display
+        
+        # Create subplots with improved spacing
+        self.ax1 = self.fig.add_subplot(221)  # Top left: Loss
+        self.ax1.set_title("Training Loss", fontsize=12, fontweight='bold')
+        self.ax1.set_xlabel("Iteration", fontsize=10)
+        self.ax1.set_ylabel("Loss", fontsize=10)
+        self.ax1.grid(True, alpha=0.3, linestyle='--')
+        self.loss_line, = self.ax1.plot([], [], 'r-', label='Loss', linewidth=1.5, alpha=0.7)
+        self.loss_smooth_line, = self.ax1.plot([], [], 'r-', label='Loss (Smoothed)', linewidth=2.5)
+        self.ax1.legend(fontsize=9)
+        
+        # Top right: Perplexity with improved scaling
+        self.ax2 = self.fig.add_subplot(222)
+        self.ax2.set_title("Training Perplexity", fontsize=12, fontweight='bold')
+        self.ax2.set_xlabel("Iteration", fontsize=10)
+        self.ax2.set_ylabel("Perplexity", fontsize=10)
+        self.ax2.grid(True, alpha=0.3, linestyle='--')
+        self.perplexity_line, = self.ax2.plot([], [], 'b-', label='Perplexity', linewidth=1.5, alpha=0.7)
+        self.perplexity_smooth_line, = self.ax2.plot([], [], 'b-', label='Perplexity (Smoothed)', linewidth=2.5)
+        self.ax2.legend(fontsize=9)
+        
+        # Bottom left: Combined view with dual y-axis (improved)
+        self.ax3 = self.fig.add_subplot(223)
+        self.ax3.set_title("Loss & Perplexity Combined", fontsize=12, fontweight='bold')
+        self.ax3.set_xlabel("Iteration", fontsize=10)
+        self.ax3.set_ylabel("Loss", color='darkred', fontsize=10)
+        self.ax3.tick_params(axis='y', labelcolor='darkred')
+        self.ax3.grid(True, alpha=0.3, linestyle='--')
+        self.combined_loss_line, = self.ax3.plot([], [], 'r-', label='Loss', linewidth=2)
+        
+        # Create second y-axis for perplexity with better scaling
+        self.ax3_twin = self.ax3.twinx()
+        self.ax3_twin.set_ylabel("Perplexity", color='darkblue', fontsize=10)
+        self.ax3_twin.tick_params(axis='y', labelcolor='darkblue')
+        self.combined_perplexity_line, = self.ax3_twin.plot([], [], 'b-', label='Perplexity', linewidth=2)
+        
+        # Add legends for combined plot
+        lines1, labels1 = self.ax3.get_legend_handles_labels()
+        lines2, labels2 = self.ax3_twin.get_legend_handles_labels()
+        self.ax3.legend(lines1 + lines2, labels1 + labels2, loc='upper right', fontsize=9)
+        
+        # Bottom right: Learning rate and metrics
+        self.ax4 = self.fig.add_subplot(224)
+        self.ax4.set_title("Learning Rate & Gradient Norm", fontsize=12, fontweight='bold')
+        self.ax4.set_xlabel("Iteration", fontsize=10)
+        self.ax4.set_ylabel("Learning Rate", color='green', fontsize=10)
+        self.ax4.tick_params(axis='y', labelcolor='green')
+        self.ax4.grid(True, alpha=0.3, linestyle='--')
+        self.lr_line, = self.ax4.plot([], [], 'g-', label='Learning Rate', linewidth=2)
+        
+        # Set initial y-axis limits for learning rate to avoid empty plot
+        self.ax4.set_ylim(0, 0.001)  # Default range
+        
+        # Second y-axis for gradient norm
+        self.ax4_twin = self.ax4.twinx()
+        self.ax4_twin.set_ylabel("Gradient Norm", color='orange', fontsize=10)
+        self.ax4_twin.tick_params(axis='y', labelcolor='orange')
+        self.grad_norm_line, = self.ax4_twin.plot([], [], 'orange', label='Grad Norm', linewidth=2)
+        
+        # Set initial y-axis limits for gradient norm
+        self.ax4_twin.set_ylim(0, 2.0)  # Default range
+        
+        # Add legends for metrics plot
+        lines3, labels3 = self.ax4.get_legend_handles_labels()
+        lines4, labels4 = self.ax4_twin.get_legend_handles_labels()
+        self.ax4.legend(lines3 + lines4, labels3 + labels4, loc='upper right', fontsize=9)
+        
+        # Adjust layout to prevent overlapping
+        self.fig.tight_layout(pad=4.0)
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=right_container)
+        self.canvas.draw()
+        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+    def create_model_settings_tab(self):
+        """Create unified Model Settings tab combining VRAM profiles and hyperparameters"""
+        settings_frame = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(settings_frame, text='Model Settings')
+
+        # Create scrollable frame for all controls
+        canvas = tk.Canvas(settings_frame)
+        scrollbar = ttk.Scrollbar(settings_frame, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        # VRAM Optimization Section
+        vram_frame = tk.LabelFrame(scrollable_frame, text="VRAM & Memory Settings", padx=10, pady=5)
+        vram_frame.pack(fill='x', pady=5)
         
         tk.Label(vram_frame, text="GPU Memory Profile:", font=("Arial", 10, "bold")).pack(anchor='w', pady=2)
         
@@ -503,399 +1072,167 @@ https://github.com/DatGuyShorty/DGS-GPT"""
         # VRAM info display
         self.vram_info_label = tk.Label(vram_frame, text="", font=("Arial", 8), fg="blue")
         self.vram_info_label.pack(anchor='w', padx=20, pady=2)
+
+        # Quick Apply Section
+        apply_frame = tk.LabelFrame(scrollable_frame, text="Quick Apply to Training", padx=10, pady=5)
+        apply_frame.pack(fill='x', pady=5)
         
-        # Initialize VRAM profile info
-        self.on_vram_profile_change()
-
-        # Controls frame with evaluation
-        controls_frame = tk.Frame(tab)
-        controls_frame.pack(fill='x', pady=5)
+        apply_controls = tk.Frame(apply_frame)
+        apply_controls.pack(fill='x', pady=5)
         
-        # First row - main controls
-        controls_row1 = tk.Frame(controls_frame)
-        controls_row1.pack(fill='x', pady=2)
+        tk.Button(apply_controls, text="Apply Current Settings", command=self.apply_current_settings,
+                 bg='lightgreen', font=("Arial", 10, "bold")).pack(side='left', padx=5)
+        tk.Button(apply_controls, text="Reset to Defaults", command=self.reset_model_settings,
+                 bg='lightcoral').pack(side='left', padx=5)
         
-        tk.Label(controls_row1, text="Iterations:").pack(side='left', padx=5)
-        self.iters_input = tk.Entry(controls_row1, width=10)
-        self.iters_input.insert(0, "1000")
-        self.iters_input.pack(side='left', padx=5)
+        # Apply settings info
+        tk.Label(apply_frame, text="Apply changes to active training session without restarting",
+                font=("Arial", 8), fg="gray").pack(anchor='w', padx=5)
 
-        tk.Label(controls_row1, text="Plot Step:").pack(side='left', padx=5)
-        self.plot_step_input = tk.Entry(controls_row1, width=10)
-        self.plot_step_input.insert(0, "100")
-        self.plot_step_input.pack(side='left', padx=5)
-
-        self.train_button = tk.Button(controls_row1, text="Start Training", command=self.start_training_thread)
-        self.train_button.pack(side='left', padx=5)
-
-        self.stop_button = tk.Button(controls_row1, text="Stop Training", command=self.stop_training, state="disabled")
-        self.stop_button.pack(side='left', padx=5)
-        
-        # Second row - evaluation controls
-        controls_row2 = tk.Frame(controls_frame)
-        controls_row2.pack(fill='x', pady=2)
-        
-        self.eval_button = tk.Button(controls_row2, text="Evaluate Model", command=self.evaluate_model)
-        self.eval_button.pack(side='left', padx=5)
-        
-        tk.Label(controls_row2, text="Eval Iters:").pack(side='left', padx=5)
-        self.eval_iters_input = tk.Entry(controls_row2, width=8)
-        self.eval_iters_input.insert(0, "100")
-        self.eval_iters_input.pack(side='left', padx=5)
-        
-        # Evaluation results
-        self.eval_results_label = tk.Label(controls_row2, text="", fg="blue")
-        self.eval_results_label.pack(side='left', padx=20)
-
-        # Progress bar
-        self.progress_bar = ttk.Progressbar(tab, orient='horizontal', mode='determinate')
-        self.progress_bar.pack(fill='x', pady=5)
-
-        # Current hyperparameters display
-        hyperparam_display_frame = tk.LabelFrame(tab, text="Current Hyperparameters", padx=10, pady=5)
-        hyperparam_display_frame.pack(fill='x', pady=5)
-        
-        self.hyperparam_text = scrolledtext.ScrolledText(hyperparam_display_frame, height=8, wrap=tk.WORD, state="disabled")
-        self.hyperparam_text.pack(fill='x', pady=5)
-        self.update_hyperparameter_display()
-
-        self.fig = Figure(figsize=(5, 4), dpi=100)
-        self.ax = self.fig.add_subplot(111)
-        self.ax.set_title("Training Loss")
-        self.ax.set_xlabel("Update Step")
-        self.ax.set_ylabel("Loss")
-        self.line, = self.ax.plot([], [], 'r-')
-
-        self.canvas = FigureCanvasTkAgg(self.fig, master=tab)
-        self.canvas.draw()
-        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-
-    def create_hyperparameter_tab(self):
-        hyperparam_frame = ttk.Frame(self.notebook, padding="10")
-        self.notebook.add(hyperparam_frame, text='Hyperparameter Optimization')
-
-        # Create scrollable frame for all controls
-        canvas = tk.Canvas(hyperparam_frame)
-        scrollbar = ttk.Scrollbar(hyperparam_frame, orient="vertical", command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas)
-
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        # Basic Controls frame
-        basic_frame = tk.LabelFrame(scrollable_frame, text="Basic Settings", padx=10, pady=5)
-        basic_frame.pack(fill='x', pady=5)
-        
-        basic_controls = tk.Frame(basic_frame)
-        basic_controls.pack(fill='x', pady=5)
-        
-        tk.Label(basic_controls, text="Number of Trials:").pack(side='left', padx=5)
-        self.trials_input = tk.Entry(basic_controls, width=10)
-        self.trials_input.insert(0, "10")
-        self.trials_input.pack(side='left', padx=5)
-
-        tk.Label(basic_controls, text="Steps per Trial:").pack(side='left', padx=5)
-        self.steps_per_trial_input = tk.Entry(basic_controls, width=10)
-        self.steps_per_trial_input.insert(0, "100")
-        self.steps_per_trial_input.pack(side='left', padx=5)
-
-        # Parameter Selection frame
-        param_frame = tk.LabelFrame(scrollable_frame, text="Parameters to Optimize", padx=10, pady=5)
-        param_frame.pack(fill='x', pady=5)
-
-        # Learning Rate
-        lr_frame = tk.Frame(param_frame)
-        lr_frame.pack(fill='x', pady=2)
-        self.optimize_lr_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(lr_frame, text="Learning Rate", variable=self.optimize_lr_var, 
-                      command=self.on_param_toggle).pack(side='left', padx=5)
-        tk.Label(lr_frame, text="Min:").pack(side='left', padx=(20,2))
-        self.lr_min_entry = tk.Entry(lr_frame, width=10)
-        self.lr_min_entry.insert(0, "1e-5")
-        self.lr_min_entry.pack(side='left', padx=2)
-        tk.Label(lr_frame, text="Max:").pack(side='left', padx=2)
-        self.lr_max_entry = tk.Entry(lr_frame, width=10)
-        self.lr_max_entry.insert(0, "1e-2")
-        self.lr_max_entry.pack(side='left', padx=2)
-        tk.Label(lr_frame, text="Fixed:").pack(side='left', padx=(10,2))
-        self.lr_fixed_entry = tk.Entry(lr_frame, width=10)
-        self.lr_fixed_entry.insert(0, str(self.config.learning_rate))
-        self.lr_fixed_entry.pack(side='left', padx=2)
-
-        # Weight Decay
-        wd_frame = tk.Frame(param_frame)
-        wd_frame.pack(fill='x', pady=2)
-        self.optimize_wd_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(wd_frame, text="Weight Decay", variable=self.optimize_wd_var, 
-                      command=self.on_param_toggle).pack(side='left', padx=5)
-        tk.Label(wd_frame, text="Min:").pack(side='left', padx=(20,2))
-        self.wd_min_entry = tk.Entry(wd_frame, width=10)
-        self.wd_min_entry.insert(0, "1e-6")
-        self.wd_min_entry.pack(side='left', padx=2)
-        tk.Label(wd_frame, text="Max:").pack(side='left', padx=2)
-        self.wd_max_entry = tk.Entry(wd_frame, width=10)
-        self.wd_max_entry.insert(0, "1e-2")
-        self.wd_max_entry.pack(side='left', padx=2)
-        tk.Label(wd_frame, text="Fixed:").pack(side='left', padx=(10,2))
-        self.wd_fixed_entry = tk.Entry(wd_frame, width=10)
-        self.wd_fixed_entry.insert(0, str(self.config.weight_decay))
-        self.wd_fixed_entry.pack(side='left', padx=2)
-
-        # Embedding Dimension
-        embd_frame = tk.Frame(param_frame)
-        embd_frame.pack(fill='x', pady=2)
-        self.optimize_embd_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(embd_frame, text="Embedding Dim", variable=self.optimize_embd_var, 
-                      command=self.on_param_toggle).pack(side='left', padx=5)
-        tk.Label(embd_frame, text="Choices:").pack(side='left', padx=(20,2))
-        self.embd_choices_entry = tk.Entry(embd_frame, width=15)
-        self.embd_choices_entry.insert(0, "256,512,1024")
-        self.embd_choices_entry.pack(side='left', padx=2)
-        tk.Label(embd_frame, text="Fixed:").pack(side='left', padx=(10,2))
-        self.embd_fixed_entry = tk.Entry(embd_frame, width=10)
-        self.embd_fixed_entry.insert(0, str(self.config.n_embd))
-        self.embd_fixed_entry.pack(side='left', padx=2)
-
-        # Number of Layers
-        layers_frame = tk.Frame(param_frame)
-        layers_frame.pack(fill='x', pady=2)
-        self.optimize_layers_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(layers_frame, text="Layers", variable=self.optimize_layers_var, 
-                      command=self.on_param_toggle).pack(side='left', padx=5)
-        tk.Label(layers_frame, text="Min:").pack(side='left', padx=(20,2))
-        self.layers_min_entry = tk.Entry(layers_frame, width=10)
-        self.layers_min_entry.insert(0, "4")
-        self.layers_min_entry.pack(side='left', padx=2)
-        tk.Label(layers_frame, text="Max:").pack(side='left', padx=2)
-        self.layers_max_entry = tk.Entry(layers_frame, width=10)
-        self.layers_max_entry.insert(0, "16")
-        self.layers_max_entry.pack(side='left', padx=2)
-        tk.Label(layers_frame, text="Fixed:").pack(side='left', padx=(10,2))
-        self.layers_fixed_entry = tk.Entry(layers_frame, width=10)
-        self.layers_fixed_entry.insert(0, str(self.config.n_layer))
-        self.layers_fixed_entry.pack(side='left', padx=2)
-
-        # Number of Heads
-        heads_frame = tk.Frame(param_frame)
-        heads_frame.pack(fill='x', pady=2)
-        self.optimize_heads_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(heads_frame, text="Heads", variable=self.optimize_heads_var, 
-                      command=self.on_param_toggle).pack(side='left', padx=5)
-        tk.Label(heads_frame, text="Choices:").pack(side='left', padx=(20,2))
-        self.heads_choices_entry = tk.Entry(heads_frame, width=15)
-        self.heads_choices_entry.insert(0, "4,8,16")
-        self.heads_choices_entry.pack(side='left', padx=2)
-        tk.Label(heads_frame, text="Fixed:").pack(side='left', padx=(10,2))
-        self.heads_fixed_entry = tk.Entry(heads_frame, width=10)
-        self.heads_fixed_entry.insert(0, str(self.config.n_head))
-        self.heads_fixed_entry.pack(side='left', padx=2)
-
-        # Dropout
-        dropout_frame = tk.Frame(param_frame)
-        dropout_frame.pack(fill='x', pady=2)
-        self.optimize_dropout_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(dropout_frame, text="Dropout", variable=self.optimize_dropout_var, 
-                      command=self.on_param_toggle).pack(side='left', padx=5)
-        tk.Label(dropout_frame, text="Min:").pack(side='left', padx=(20,2))
-        self.dropout_min_entry = tk.Entry(dropout_frame, width=10)
-        self.dropout_min_entry.insert(0, "0.0")
-        self.dropout_min_entry.pack(side='left', padx=2)
-        tk.Label(dropout_frame, text="Max:").pack(side='left', padx=2)
-        self.dropout_max_entry = tk.Entry(dropout_frame, width=10)
-        self.dropout_max_entry.insert(0, "0.5")
-        self.dropout_max_entry.pack(side='left', padx=2)
-        tk.Label(dropout_frame, text="Fixed:").pack(side='left', padx=(10,2))
-        self.dropout_fixed_entry = tk.Entry(dropout_frame, width=10)
-        self.dropout_fixed_entry.insert(0, str(self.config.dropout))
-        self.dropout_fixed_entry.pack(side='left', padx=2)
-
-        # Batch Size
-        batch_frame = tk.Frame(param_frame)
-        batch_frame.pack(fill='x', pady=2)
-        self.optimize_batch_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(batch_frame, text="Batch Size", variable=self.optimize_batch_var, 
-                      command=self.on_param_toggle).pack(side='left', padx=5)
-        tk.Label(batch_frame, text="Choices:").pack(side='left', padx=(20,2))
-        self.batch_choices_entry = tk.Entry(batch_frame, width=15)
-        self.batch_choices_entry.insert(0, "8,16,24,32")
-        self.batch_choices_entry.pack(side='left', padx=2)
-        tk.Label(batch_frame, text="Fixed:").pack(side='left', padx=(10,2))
-        self.batch_fixed_entry = tk.Entry(batch_frame, width=10)
-        self.batch_fixed_entry.insert(0, str(self.config.batch_size))
-        self.batch_fixed_entry.pack(side='left', padx=2)
-
-        # Architecture settings frame
-        arch_frame = tk.LabelFrame(scrollable_frame, text="Architecture Settings", padx=10, pady=5)
+        # Architecture Settings
+        arch_frame = tk.LabelFrame(scrollable_frame, text="Model Architecture", padx=10, pady=5)
         arch_frame.pack(fill='x', pady=5)
+        
+        # Basic model parameters
+        basic_arch = tk.Frame(arch_frame)
+        basic_arch.pack(fill='x', pady=2)
+        
+        tk.Label(basic_arch, text="Embedding Dim:").pack(side='left', padx=5)
+        self.embd_dim_var = tk.StringVar(value=str(self.config.n_embd))
+        embd_combo = ttk.Combobox(basic_arch, textvariable=self.embd_dim_var, 
+                                 values=["256", "512", "1024", "1536", "2048"], width=8, state="readonly")
+        embd_combo.pack(side='left', padx=5)
+        
+        tk.Label(basic_arch, text="Layers:").pack(side='left', padx=(20,5))
+        self.layers_var = tk.StringVar(value=str(self.config.n_layer))
+        layers_combo = ttk.Combobox(basic_arch, textvariable=self.layers_var, 
+                                   values=["4", "6", "8", "12", "16", "20", "24"], width=8, state="readonly")
+        layers_combo.pack(side='left', padx=5)
+        
+        tk.Label(basic_arch, text="Heads:").pack(side='left', padx=(20,5))
+        self.heads_var = tk.StringVar(value=str(self.config.n_head))
+        heads_combo = ttk.Combobox(basic_arch, textvariable=self.heads_var, 
+                                  values=["4", "8", "12", "16", "20"], width=8, state="readonly")
+        heads_combo.pack(side='left', padx=5)
 
-        # MoE settings
-        moe_frame = tk.Frame(arch_frame)
-        moe_frame.pack(fill='x', pady=2)
+        # Advanced architecture
+        adv_arch = tk.Frame(arch_frame)
+        adv_arch.pack(fill='x', pady=2)
         
         self.use_moe_var = tk.BooleanVar(value=self.config.use_moe)
-        tk.Checkbutton(moe_frame, text="Use Mixture of Experts (MoE)", variable=self.use_moe_var, 
-                      command=self.on_moe_toggle).pack(side='left', padx=5)
+        tk.Checkbutton(adv_arch, text="Use Mixture of Experts (MoE)", variable=self.use_moe_var).pack(side='left', padx=5)
         
-        tk.Label(moe_frame, text="Experts:").pack(side='left', padx=(20,5))
+        tk.Label(adv_arch, text="Experts:").pack(side='left', padx=(20,5))
         self.moe_experts_var = tk.StringVar(value=str(self.config.moe_num_experts))
-        moe_experts_combo = ttk.Combobox(moe_frame, textvariable=self.moe_experts_var, 
+        moe_experts_combo = ttk.Combobox(adv_arch, textvariable=self.moe_experts_var, 
                                         values=["2", "4", "8"], width=5, state="readonly")
         moe_experts_combo.pack(side='left', padx=5)
         
-        tk.Label(moe_frame, text="Top-K:").pack(side='left', padx=(10,5))
+        tk.Label(adv_arch, text="Top-K:").pack(side='left', padx=(10,5))
         self.moe_k_var = tk.StringVar(value=str(self.config.moe_k))
-        moe_k_combo = ttk.Combobox(moe_frame, textvariable=self.moe_k_var, 
+        moe_k_combo = ttk.Combobox(adv_arch, textvariable=self.moe_k_var, 
                                   values=["1", "2"], width=5, state="readonly")
         moe_k_combo.pack(side='left', padx=5)
 
-        # Attention type settings
-        attn_frame = tk.Frame(arch_frame)
-        attn_frame.pack(fill='x', pady=2)
+        # Attention settings
+        attn_arch = tk.Frame(arch_frame)
+        attn_arch.pack(fill='x', pady=2)
         
-        tk.Label(attn_frame, text="Attention Type:").pack(side='left', padx=5)
+        tk.Label(attn_arch, text="Attention Type:").pack(side='left', padx=5)
         self.attention_type_var = tk.StringVar(value=self.config.attention_type)
-        attn_combo = ttk.Combobox(attn_frame, textvariable=self.attention_type_var, 
+        attn_combo = ttk.Combobox(attn_arch, textvariable=self.attention_type_var, 
                                  values=["multihead", "grouped_query"], width=15, state="readonly")
         attn_combo.pack(side='left', padx=5)
         attn_combo.bind('<<ComboboxSelected>>', self.on_attention_type_change)
         
-        tk.Label(attn_frame, text="Query Groups:").pack(side='left', padx=(20,5))
+        tk.Label(attn_arch, text="Query Groups:").pack(side='left', padx=(20,5))
         self.query_groups_var = tk.StringVar(value=str(self.config.n_query_groups))
-        self.query_groups_combo = ttk.Combobox(attn_frame, textvariable=self.query_groups_var, 
+        self.query_groups_combo = ttk.Combobox(attn_arch, textvariable=self.query_groups_var, 
                                               values=["1", "2", "4", "8"], width=5, state="readonly")
         self.query_groups_combo.pack(side='left', padx=5)
-        
-        # Update query groups based on initial attention type
-        self.on_attention_type_change()
 
-        # Sampler Settings frame
-        sampler_frame = tk.LabelFrame(scrollable_frame, text="Sampler & Pruner Settings", padx=10, pady=5)
-        sampler_frame.pack(fill='x', pady=5)
-
-        sampler_controls = tk.Frame(sampler_frame)
-        sampler_controls.pack(fill='x', pady=2)
+        # Training Hyperparameters
+        hyper_frame = tk.LabelFrame(scrollable_frame, text="Training Hyperparameters", padx=10, pady=5)
+        hyper_frame.pack(fill='x', pady=5)
         
-        tk.Label(sampler_controls, text="Sampler:").pack(side='left', padx=5)
+        # Learning parameters
+        lr_frame = tk.Frame(hyper_frame)
+        lr_frame.pack(fill='x', pady=2)
+        
+        tk.Label(lr_frame, text="Learning Rate:").pack(side='left', padx=5)
+        self.lr_var = tk.StringVar(value=str(self.config.learning_rate))
+        lr_entry = tk.Entry(lr_frame, textvariable=self.lr_var, width=12)
+        lr_entry.pack(side='left', padx=5)
+        
+        tk.Label(lr_frame, text="Weight Decay:").pack(side='left', padx=(20,5))
+        self.wd_var = tk.StringVar(value=str(self.config.weight_decay))
+        wd_entry = tk.Entry(lr_frame, textvariable=self.wd_var, width=12)
+        wd_entry.pack(side='left', padx=5)
+        
+        tk.Label(lr_frame, text="Dropout:").pack(side='left', padx=(20,5))
+        self.dropout_var = tk.StringVar(value=str(self.config.dropout))
+        dropout_entry = tk.Entry(lr_frame, textvariable=self.dropout_var, width=12)
+        dropout_entry.pack(side='left', padx=5)
+
+        # Batch and optimization
+        batch_frame = tk.Frame(hyper_frame)
+        batch_frame.pack(fill='x', pady=2)
+        
+        tk.Label(batch_frame, text="Batch Size:").pack(side='left', padx=5)
+        self.batch_size_var = tk.StringVar(value=str(self.config.batch_size))
+        batch_entry = tk.Entry(batch_frame, textvariable=self.batch_size_var, width=8)
+        batch_entry.pack(side='left', padx=5)
+        
+        tk.Label(batch_frame, text="Block Size:").pack(side='left', padx=(20,5))
+        self.block_size_var = tk.StringVar(value=str(self.config.block_size))
+        block_combo = ttk.Combobox(batch_frame, textvariable=self.block_size_var, 
+                                  values=["512", "1024", "2048", "4096"], width=8, state="readonly")
+        block_combo.pack(side='left', padx=5)
+
+        # Optimization Settings
+        optim_frame = tk.LabelFrame(scrollable_frame, text="Hyperparameter Optimization", padx=10, pady=5)
+        optim_frame.pack(fill='x', pady=5)
+        
+        # Basic optimization controls
+        optim_basic = tk.Frame(optim_frame)
+        optim_basic.pack(fill='x', pady=2)
+        
+        tk.Label(optim_basic, text="Trials:").pack(side='left', padx=5)
+        self.trials_input = tk.Entry(optim_basic, width=8)
+        self.trials_input.insert(0, "10")
+        self.trials_input.pack(side='left', padx=5)
+        
+        tk.Label(optim_basic, text="Steps/Trial:").pack(side='left', padx=(20,5))
+        self.steps_per_trial_input = tk.Entry(optim_basic, width=8)
+        self.steps_per_trial_input.insert(0, "100")
+        self.steps_per_trial_input.pack(side='left', padx=5)
+        
+        tk.Label(optim_basic, text="Sampler:").pack(side='left', padx=(20,5))
         self.sampler_var = tk.StringVar(value="tpe")
-        sampler_combo = ttk.Combobox(sampler_controls, textvariable=self.sampler_var, 
+        sampler_combo = ttk.Combobox(optim_basic, textvariable=self.sampler_var, 
                                     values=["tpe", "random", "grid", "cmaes"], width=10, state="readonly")
         sampler_combo.pack(side='left', padx=5)
-        
-        tk.Label(sampler_controls, text="Pruner:").pack(side='left', padx=(20,5))
-        self.pruner_var = tk.StringVar(value="median")
-        pruner_combo = ttk.Combobox(sampler_controls, textvariable=self.pruner_var, 
-                                   values=["median", "percentile", "successive_halving", "none"], width=15, state="readonly")
-        pruner_combo.pack(side='left', padx=5)
 
-        sampler_params = tk.Frame(sampler_frame)
-        sampler_params.pack(fill='x', pady=2)
+        # Optimization checkboxes
+        optim_params = tk.Frame(optim_frame)
+        optim_params.pack(fill='x', pady=5)
         
-        tk.Label(sampler_params, text="Startup Trials:").pack(side='left', padx=5)
-        self.startup_trials_entry = tk.Entry(sampler_params, width=8)
-        self.startup_trials_entry.insert(0, "10")
-        self.startup_trials_entry.pack(side='left', padx=5)
+        tk.Label(optim_params, text="Optimize:", font=("Arial", 9, "bold")).pack(anchor='w')
         
-        tk.Label(sampler_params, text="Seed:").pack(side='left', padx=(20,5))
-        self.seed_entry = tk.Entry(sampler_params, width=10)
-        self.seed_entry.insert(0, "")
-        self.seed_entry.pack(side='left', padx=5)
+        checkbox_frame = tk.Frame(optim_params)
+        checkbox_frame.pack(fill='x')
         
-        self.multivariate_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(sampler_params, text="Multivariate", variable=self.multivariate_var).pack(side='left', padx=20)
-
-        # Pruner parameters frame
-        pruner_params = tk.Frame(sampler_frame)
-        pruner_params.pack(fill='x', pady=2)
+        self.optimize_lr_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(checkbox_frame, text="Learning Rate", variable=self.optimize_lr_var).pack(side='left', padx=10)
         
-        # Add help text for pruner parameters
-        help_label = tk.Label(pruner_params, text="Pruner Parameters:", font=("Arial", 9, "bold"))
-        help_label.pack(anchor='w', padx=5, pady=(5,2))
+        self.optimize_wd_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(checkbox_frame, text="Weight Decay", variable=self.optimize_wd_var).pack(side='left', padx=10)
         
-        # Median Pruner parameters
-        median_frame = tk.Frame(pruner_params)
-        median_frame.pack(fill='x', pady=2)
-        tk.Label(median_frame, text="Median Pruner:", fg="blue").pack(side='left', padx=5)
+        self.optimize_embd_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(checkbox_frame, text="Embedding Dim", variable=self.optimize_embd_var).pack(side='left', padx=10)
         
-        tk.Label(median_frame, text="Startup Trials:").pack(side='left', padx=(10,2))
-        self.median_startup_entry = tk.Entry(median_frame, width=6)
-        self.median_startup_entry.insert(0, "5")
-        self.median_startup_entry.pack(side='left', padx=2)
-        
-        tk.Label(median_frame, text="Warmup Steps:").pack(side='left', padx=(10,2))
-        self.median_warmup_entry = tk.Entry(median_frame, width=6)
-        self.median_warmup_entry.insert(0, "10")
-        self.median_warmup_entry.pack(side='left', padx=2)
-        
-        tk.Label(median_frame, text="Min Trials:").pack(side='left', padx=(10,2))
-        self.median_min_trials_entry = tk.Entry(median_frame, width=6)
-        self.median_min_trials_entry.insert(0, "5")
-        self.median_min_trials_entry.pack(side='left', padx=2)
-        
-        # Add tooltip info
-        median_info = tk.Label(median_frame, text="ℹ", fg="gray", cursor="hand2")
-        median_info.pack(side='left', padx=5)
-        
-        # Percentile Pruner parameters
-        percentile_frame = tk.Frame(pruner_params)
-        percentile_frame.pack(fill='x', pady=2)
-        tk.Label(percentile_frame, text="Percentile Pruner:", fg="green").pack(side='left', padx=5)
-        
-        tk.Label(percentile_frame, text="Percentile:").pack(side='left', padx=(10,2))
-        self.percentile_entry = tk.Entry(percentile_frame, width=8)
-        self.percentile_entry.insert(0, "25.0")
-        self.percentile_entry.pack(side='left', padx=2)
-        
-        tk.Label(percentile_frame, text="Startup Trials:").pack(side='left', padx=(10,2))
-        self.percentile_startup_entry = tk.Entry(percentile_frame, width=6)
-        self.percentile_startup_entry.insert(0, "5")
-        self.percentile_startup_entry.pack(side='left', padx=2)
-        
-        tk.Label(percentile_frame, text="Warmup Steps:").pack(side='left', padx=(10,2))
-        self.percentile_warmup_entry = tk.Entry(percentile_frame, width=6)
-        self.percentile_warmup_entry.insert(0, "0")
-        self.percentile_warmup_entry.pack(side='left', padx=2)
-        
-        percentile_info = tk.Label(percentile_frame, text="ℹ", fg="gray", cursor="hand2")
-        percentile_info.pack(side='left', padx=5)
-        
-        # Successive Halving Pruner parameters
-        halving_frame = tk.Frame(pruner_params)
-        halving_frame.pack(fill='x', pady=2)
-        tk.Label(halving_frame, text="Successive Halving:", fg="red").pack(side='left', padx=5)
-        
-        tk.Label(halving_frame, text="Min Resource:").pack(side='left', padx=(10,2))
-        self.halving_min_resource_entry = tk.Entry(halving_frame, width=6)
-        self.halving_min_resource_entry.insert(0, "1")
-        self.halving_min_resource_entry.pack(side='left', padx=2)
-        
-        tk.Label(halving_frame, text="Reduction Factor:").pack(side='left', padx=(10,2))
-        self.halving_reduction_entry = tk.Entry(halving_frame, width=6)
-        self.halving_reduction_entry.insert(0, "4")
-        self.halving_reduction_entry.pack(side='left', padx=2)
-        
-        tk.Label(halving_frame, text="Min Early Stop:").pack(side='left', padx=(10,2))
-        self.halving_min_early_stop_entry = tk.Entry(halving_frame, width=6)
-        self.halving_min_early_stop_entry.insert(0, "5")
-        self.halving_min_early_stop_entry.pack(side='left', padx=2)
-        
-        halving_info = tk.Label(halving_frame, text="ℹ", fg="gray", cursor="hand2")
-        halving_info.pack(side='left', padx=5)
-        
-        # Pruner description frame
-        desc_frame = tk.Frame(pruner_params)
-        desc_frame.pack(fill='x', pady=(5,0))
-        pruner_desc = tk.Text(desc_frame, height=3, font=("Arial", 8), bg="#f0f0f0", wrap=tk.WORD)
-        pruner_desc.pack(fill='x', padx=5)
-        pruner_desc.insert("1.0", 
-            "• Median: Prunes trials below median performance after warmup steps\n"
-            "• Percentile: Prunes trials below specified percentile threshold\n"
-            "• Successive Halving: Resource-efficient pruning with successive reductions")
-        pruner_desc.config(state="disabled")
+        self.optimize_layers_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(checkbox_frame, text="Layers", variable=self.optimize_layers_var).pack(side='left', padx=10)
 
         # Controls frame
         controls_frame = tk.Frame(scrollable_frame)
@@ -913,15 +1250,19 @@ https://github.com/DatGuyShorty/DGS-GPT"""
 
         # Log display
         tk.Label(scrollable_frame, text="Optimization Log:").pack(pady=(10,5), anchor="w")
-        self.optim_log_text = scrolledtext.ScrolledText(scrollable_frame, height=15, wrap=tk.WORD, state="disabled")
+        self.optim_log_text = scrolledtext.ScrolledText(scrollable_frame, height=10, wrap=tk.WORD, state="disabled")
         self.optim_log_text.pack(fill="both", expand=True, pady=5)
 
         # Pack canvas and scrollbar
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
-        # Initialize parameter states
-        self.on_param_toggle()
+        # Initialize VRAM profile info
+        if not (hasattr(self, '_initializing') and self._initializing):
+            self.on_vram_profile_change()
+        
+        # Update attention type state
+        self.on_attention_type_change()
 
     def on_moe_toggle(self):
         """Handle MoE checkbox toggle"""
@@ -942,96 +1283,34 @@ https://github.com/DatGuyShorty/DGS-GPT"""
     def on_param_toggle(self):
         """Handle parameter optimization toggle"""
         # Enable/disable parameter entry fields based on checkbox states
-        params = [
-            (self.optimize_lr_var, [self.lr_min_entry, self.lr_max_entry], [self.lr_fixed_entry]),
-            (self.optimize_wd_var, [self.wd_min_entry, self.wd_max_entry], [self.wd_fixed_entry]),
-            (self.optimize_embd_var, [self.embd_choices_entry], [self.embd_fixed_entry]),
-            (self.optimize_layers_var, [self.layers_min_entry, self.layers_max_entry], [self.layers_fixed_entry]),
-            (self.optimize_heads_var, [self.heads_choices_entry], [self.heads_fixed_entry]),
-            (self.optimize_dropout_var, [self.dropout_min_entry, self.dropout_max_entry], [self.dropout_fixed_entry]),
-            (self.optimize_batch_var, [self.batch_choices_entry], [self.batch_fixed_entry])
-        ]
+        # Only process if we have the advanced optimization UI (which we don't in the current simplified interface)
+        if not hasattr(self, 'lr_min_entry'):
+            # Skip this method if we don't have the advanced optimization interface
+            return
         
-        for var, optimize_entries, fixed_entries in params:
-            if var.get():
-                # Enable optimization entries, disable fixed
-                for entry in optimize_entries:
-                    entry.config(state="normal")
-                for entry in fixed_entries:
-                    entry.config(state="disabled")
-            else:
-                # Disable optimization entries, enable fixed
-                for entry in optimize_entries:
-                    entry.config(state="disabled")
-                for entry in fixed_entries:
-                    entry.config(state="normal")
+        # This method is for advanced optimization UI that doesn't exist in current interface
+        pass
 
     def get_parameter_config(self):
         """Get parameter configuration from GUI controls"""
         param_config = {}
         
-        try:
-            # Learning Rate
-            param_config['optimize_lr'] = self.optimize_lr_var.get()
-            if param_config['optimize_lr']:
-                param_config['lr_min'] = float(self.lr_min_entry.get())
-                param_config['lr_max'] = float(self.lr_max_entry.get())
-            else:
-                param_config['lr_value'] = float(self.lr_fixed_entry.get())
-            
-            # Weight Decay
-            param_config['optimize_wd'] = self.optimize_wd_var.get()
-            if param_config['optimize_wd']:
-                param_config['wd_min'] = float(self.wd_min_entry.get())
-                param_config['wd_max'] = float(self.wd_max_entry.get())
-            else:
-                param_config['wd_value'] = float(self.wd_fixed_entry.get())
-            
-            # Embedding Dimension
-            param_config['optimize_embd'] = self.optimize_embd_var.get()
-            if param_config['optimize_embd']:
-                choices_str = self.embd_choices_entry.get()
-                param_config['embd_choices'] = [int(x.strip()) for x in choices_str.split(',')]
-            else:
-                param_config['embd_value'] = int(self.embd_fixed_entry.get())
-            
-            # Layers
-            param_config['optimize_layers'] = self.optimize_layers_var.get()
-            if param_config['optimize_layers']:
-                param_config['layer_min'] = int(self.layers_min_entry.get())
-                param_config['layer_max'] = int(self.layers_max_entry.get())
-            else:
-                param_config['layer_value'] = int(self.layers_fixed_entry.get())
-            
-            # Heads
-            param_config['optimize_heads'] = self.optimize_heads_var.get()
-            if param_config['optimize_heads']:
-                choices_str = self.heads_choices_entry.get()
-                param_config['head_choices'] = [int(x.strip()) for x in choices_str.split(',')]
-            else:
-                param_config['head_value'] = int(self.heads_fixed_entry.get())
-            
-            # Dropout
-            param_config['optimize_dropout'] = self.optimize_dropout_var.get()
-            if param_config['optimize_dropout']:
-                param_config['dropout_min'] = float(self.dropout_min_entry.get())
-                param_config['dropout_max'] = float(self.dropout_max_entry.get())
-            else:
-                param_config['dropout_value'] = float(self.dropout_fixed_entry.get())
-            
-            # Batch Size
-            param_config['optimize_batch'] = self.optimize_batch_var.get()
-            if param_config['optimize_batch']:
-                choices_str = self.batch_choices_entry.get()
-                param_config['batch_choices'] = [int(x.strip()) for x in choices_str.split(',')]
-            else:
-                param_config['batch_value'] = int(self.batch_fixed_entry.get())
-            
-        except ValueError as e:
-            messagebox.showerror("Invalid Input", f"Invalid parameter value: {e}")
-            return None
+        # Only process if we have the advanced optimization UI (which we don't in the current simplified interface)
+        if not hasattr(self, 'lr_min_entry'):
+            # Return basic parameter config from current GUI elements
+            param_config = {
+                'optimize_lr': getattr(self, 'optimize_lr_var', tk.BooleanVar(value=True)).get(),
+                'optimize_wd': getattr(self, 'optimize_wd_var', tk.BooleanVar(value=True)).get(),
+                'optimize_embd': getattr(self, 'optimize_embd_var', tk.BooleanVar(value=True)).get(),
+                'optimize_layers': getattr(self, 'optimize_layers_var', tk.BooleanVar(value=True)).get(),
+                'optimize_heads': getattr(self, 'optimize_heads_var', tk.BooleanVar(value=False)).get(),
+                'optimize_dropout': getattr(self, 'optimize_dropout_var', tk.BooleanVar(value=True)).get(),
+                'optimize_batch': getattr(self, 'optimize_batch_var', tk.BooleanVar(value=False)).get(),
+            }
+            return param_config
         
-        return param_config
+        # Advanced parameter configuration (not used in current interface)
+        return {}
 
     def get_sampler_config(self):
         """Get sampler configuration from GUI controls"""
@@ -1042,14 +1321,14 @@ https://github.com/DatGuyShorty/DGS-GPT"""
         
         try:
             sampler_config['n_startup_trials'] = int(self.startup_trials_entry.get())
-        except:
+        except (ValueError, AttributeError):
             sampler_config['n_startup_trials'] = 10
         
         seed_text = self.seed_entry.get().strip()
         if seed_text:
             try:
                 sampler_config['seed'] = int(seed_text)
-            except:
+            except (ValueError, TypeError):
                 sampler_config['seed'] = None
         else:
             sampler_config['seed'] = None
@@ -1080,6 +1359,7 @@ https://github.com/DatGuyShorty/DGS-GPT"""
             sampler_config['percentile'] = 25.0
             sampler_config['percentile_startup_trials'] = 5
             sampler_config['percentile_warmup_steps'] = 0
+            
             sampler_config['halving_min_resource'] = 1
             sampler_config['halving_reduction_factor'] = 4
             sampler_config['halving_min_early_stopping_rate'] = 5
@@ -1134,40 +1414,380 @@ Attention Type: {self.config.attention_type}"""
         self.hyperparam_text.config(state="disabled")
 
     def queue_loss(self, loss):
-        self.loss_queue.put(loss)
+        self.loss_queue.put(('loss', loss))
+    
+    def queue_metrics(self, metrics):
+        self.loss_queue.put(('metrics', metrics))
+
+    def clear_console(self):
+        """Clear the console log"""
+        self.console_text.config(state='normal')
+        self.console_text.delete(1.0, tk.END)
+        self.console_text.insert(tk.END, "=== Console Cleared ===\n")
+        self.console_text.config(state='disabled')
+    
+    def save_console_log(self):
+        """Save console log to file"""
+        from tkinter import filedialog
+        import datetime
+        
+        default_filename = f"training_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        filepath = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            initialname=default_filename
+        )
+        
+        if filepath:
+            try:
+                with open(filepath, 'w', encoding='utf-8') as f:
+                    f.write(self.console_text.get(1.0, tk.END))
+                messagebox.showinfo("Log Saved", f"Console log saved to:\n{filepath}")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to save log:\n{str(e)}")
+    
+    def log_to_console(self, message, level="INFO"):
+        """Add a message to the console log"""
+        import datetime
+        timestamp = datetime.datetime.now().strftime('%H:%M:%S')
+        
+        # Color coding for different log levels
+        color_map = {
+            "INFO": "lime",
+            "WARNING": "yellow", 
+            "ERROR": "red",
+            "SUCCESS": "lightgreen",
+            "DEBUG": "cyan"
+        }
+        
+        self.console_text.config(state='normal')
+        
+        # Add timestamp and level
+        self.console_text.insert(tk.END, f"[{timestamp}] {level}: ", )
+        
+        # Add the message
+        self.console_text.insert(tk.END, f"{message}\n")
+        
+        # Auto-scroll if enabled
+        if self.auto_scroll_var.get():
+            self.console_text.see(tk.END)
+        
+        self.console_text.config(state='disabled')
+
+    def log_error(self, error_msg, context="Unknown"):
+        """Enhanced error logging with context"""
+        timestamp = __import__('datetime').datetime.now().strftime("%H:%M:%S")
+        formatted_msg = f"[{timestamp}] ERROR in {context}: {error_msg}"
+        self.log_to_console(formatted_msg, "ERROR")
+        print(formatted_msg)  # Also print to console for debugging
+
+    def smooth_data(self, data, window_size=None):
+        """Apply exponential moving average smoothing to data"""
+        if not data or len(data) < 2:
+            return data
+        
+        if window_size is None:
+            window_size = self.smoothing_window
+            
+        smoothed = [data[0]]  # Start with first value
+        alpha = 2.0 / (window_size + 1)  # EMA smoothing factor
+        
+        for i in range(1, len(data)):
+            smoothed_value = alpha * data[i] + (1 - alpha) * smoothed[-1]
+            smoothed.append(smoothed_value)
+        
+        return smoothed
 
     def process_loss_queue(self):
         try:
-            while not self.loss_queue.empty():
-                loss = self.loss_queue.get_nowait()
-                self.losses.append(loss)
+            # Process items from queue in batches to reduce overhead
+            queue_items_processed = 0
+            plot_update_needed = False
+            
+            while not self.loss_queue.empty() and queue_items_processed < 10:  # Limit batch size
+                data_type, data = self.loss_queue.get_nowait()
+                queue_items_processed += 1
+                plot_update_needed = True
+                
+                if data_type == 'loss':
+                    # Legacy loss callback for backward compatibility
+                    self.losses.append(data)
+                    
+                    # Generate sequential iteration numbers for legacy mode
+                    next_iteration = len(self.losses) - 1
+                    self.iterations.append(next_iteration)
+                    
+                    # Calculate perplexity from loss if metrics not available
+                    perplexity = math.exp(min(data, 20)) if data < 20 else self.max_perplexity_display
+                    self.perplexities.append(perplexity)
+                    
+                    # Add default values for missing metrics
+                    self.learning_rates.append(0.0)
+                    self.grad_norms.append(0.0)
+                        
+                elif data_type == 'metrics':
+                    # New comprehensive metrics - always append to maintain order
+                    iteration = data['iteration']
+                    loss = data['loss']
+                    perplexity = data.get('perplexity', math.exp(min(loss, 20)) if loss < 20 else self.max_perplexity_display)
+                    learning_rate = data.get('learning_rate', 0.0)
+                    grad_norm = data.get('grad_norm', 0.0)
+                    
+                    # Cap perplexity to reasonable values for visualization
+                    if math.isinf(perplexity) or math.isnan(perplexity) or perplexity > self.max_perplexity_display:
+                        perplexity = self.max_perplexity_display
+                    
+                    # Always append to maintain chronological order and prevent x-axis jumping
+                    # Ensure iteration is monotonically increasing
+                    if len(self.iterations) > 0:
+                        last_iter = self.iterations[-1]
+                        if iteration <= last_iter:
+                            iteration = last_iter + 1
+                    
+                    self.iterations.append(iteration)
+                    self.losses.append(loss)
+                    self.perplexities.append(perplexity)
+                    self.learning_rates.append(learning_rate)
+                    self.grad_norms.append(grad_norm)
+            
+            # Only update plot and sync arrays if needed and at reduced frequency
+            if plot_update_needed and len(self.losses) % 5 == 0:  # Update plot every 5 data points instead of every point
+                self.validate_and_sync_data_arrays()
                 self.update_plot()
+                
+        except Exception as e:
+            self.log_to_console(f"Error processing loss queue: {str(e)}", "ERROR")
         finally:
-            self.root.after(100, self.process_loss_queue)
+            # Increase update interval to 200ms to reduce CPU overhead
+            self.root.after(200, self.process_loss_queue)
+
+    def validate_and_sync_data_arrays(self):
+        """Ensure all data arrays are properly synchronized and monotonic"""
+        if not self.losses:
+            return
+            
+        # Limit data length to prevent memory issues (keep last 2000 points)
+        max_data_points = 2000
+        if len(self.losses) > max_data_points:
+            # Trim all arrays to keep only the most recent data
+            trim_count = len(self.losses) - max_data_points
+            self.losses = self.losses[trim_count:]
+            self.iterations = self.iterations[trim_count:] if self.iterations else []
+            self.perplexities = self.perplexities[trim_count:] if self.perplexities else []
+            self.learning_rates = self.learning_rates[trim_count:] if self.learning_rates else []
+            self.grad_norms = self.grad_norms[trim_count:] if self.grad_norms else []
+            
+        # Get target length from the primary array (losses)
+        target_length = len(self.losses)
+        
+        # Ensure all arrays have the same length
+        arrays = {
+            'iterations': self.iterations,
+            'perplexities': self.perplexities, 
+            'learning_rates': self.learning_rates,
+            'grad_norms': self.grad_norms
+        }
+        
+        for name, array in arrays.items():
+            while len(array) < target_length:
+                if name == 'iterations':
+                    # For iterations, use sequential numbering
+                    next_val = len(array)
+                    if len(array) > 0:
+                        next_val = max(array[-1] + 1, len(array))
+                    array.append(next_val)
+                elif name == 'perplexities':
+                    # For perplexity, calculate from corresponding loss
+                    loss_idx = len(array)
+                    if loss_idx < len(self.losses):
+                        loss = self.losses[loss_idx]
+                        perp = math.exp(min(loss, 20)) if loss < 20 else self.max_perplexity_display
+                        array.append(perp)
+                    else:
+                        array.append(self.max_perplexity_display)
+                else:
+                    # For other metrics, use default values
+                    array.append(0.0)
+            
+            # Trim if too long
+            if len(array) > target_length:
+                arrays[name] = array[:target_length]
+        
+        # Update the instance variables
+        self.iterations = arrays['iterations']
+        self.perplexities = arrays['perplexities']
+        self.learning_rates = arrays['learning_rates']
+        self.grad_norms = arrays['grad_norms']
+        
+        # Ensure iterations are strictly monotonically increasing
+        if len(self.iterations) > 1:
+            for i in range(1, len(self.iterations)):
+                if self.iterations[i] <= self.iterations[i-1]:
+                    self.iterations[i] = self.iterations[i-1] + 1
 
     def update_plot(self):
-        self.line.set_data(range(len(self.losses)), self.losses)
-        self.ax.relim()
-        self.ax.autoscale_view()
-        self.fig.canvas.draw()
+        if not self.losses:
+            return
+            
+        # Skip plot updates if data hasn't changed significantly
+        if hasattr(self, '_last_plot_size') and len(self.losses) - self._last_plot_size < 3:
+            return
+        self._last_plot_size = len(self.losses)
+            
+        # Ensure data synchronization before plotting
+        self.validate_and_sync_data_arrays()
+        
+        # Use iterations as x-axis data (should now be monotonic)
+        x_data = self.iterations if self.iterations else list(range(len(self.losses)))
+        
+        # --- Update Loss Plot (Top Left) ---
+        if hasattr(self, 'loss_line'):
+            self.loss_line.set_data(x_data, self.losses)
+            if len(self.losses) >= 3 and hasattr(self, 'loss_smooth_line'):
+                smoothed_losses = self.smooth_data(self.losses)
+                self.loss_smooth_line.set_data(x_data, smoothed_losses)
+            
+            self.ax1.relim()
+            self.ax1.autoscale_view()
+            
+            # Set reasonable y-limits for loss with caching
+            if self.losses and (not hasattr(self, '_cached_loss_limits') or len(self.losses) % 20 == 0):
+                min_loss = min(self.losses)
+                max_loss = max(self.losses)
+                if max_loss > min_loss:
+                    margin = (max_loss - min_loss) * 0.1
+                    self._cached_loss_limits = (max(0, min_loss - margin), max_loss + margin)
+                    self.ax1.set_ylim(*self._cached_loss_limits)
+        
+        # --- Update Perplexity Plot (Top Right) with reduced frequency ---
+        if hasattr(self, 'perplexity_line') and self.perplexities and len(self.losses) % 2 == 0:
+            # Filter valid perplexity values
+            valid_perplexities = []
+            valid_x = []
+            for i, (x, p) in enumerate(zip(x_data, self.perplexities)):
+                if not math.isinf(p) and not math.isnan(p) and p <= self.max_perplexity_display:
+                    valid_perplexities.append(p)
+                    valid_x.append(x)
+            
+            if valid_perplexities:
+                self.perplexity_line.set_data(valid_x, valid_perplexities)
+                if len(valid_perplexities) >= 3 and hasattr(self, 'perplexity_smooth_line'):
+                    smoothed_perplexities = self.smooth_data(valid_perplexities)
+                    self.perplexity_smooth_line.set_data(valid_x, smoothed_perplexities)
+            
+            self.ax2.relim()
+            self.ax2.autoscale_view()
+        
+        # --- Update Combined Plot (Bottom Left) with reduced frequency ---
+        if hasattr(self, 'combined_loss_line') and len(self.losses) % 3 == 0:
+            self.combined_loss_line.set_data(x_data, self.losses)
+            
+            if hasattr(self, 'combined_perplexity_line') and self.perplexities:
+                valid_perplexities = [min(p, self.max_perplexity_display) for p in self.perplexities 
+                                    if not math.isinf(p) and not math.isnan(p)]
+                if valid_perplexities and len(valid_perplexities) == len(x_data):
+                    self.combined_perplexity_line.set_data(x_data, valid_perplexities)
+            
+            self.ax3.relim()
+            self.ax3.autoscale_view()
+            if hasattr(self, 'ax3_twin'):
+                self.ax3_twin.relim()
+                self.ax3_twin.autoscale_view()
+        
+        # --- Update Learning Rate and Gradient Norm Plot (Bottom Right) ---
+        if hasattr(self, 'lr_line') and self.learning_rates and len(self.losses) % 4 == 0:
+            # Ensure data arrays match x_data length
+            lr_data = self.learning_rates[:len(x_data)]
+            lr_x_data = x_data[:len(lr_data)]
+            
+            if lr_data and lr_x_data and len(lr_data) == len(lr_x_data):
+                self.lr_line.set_data(lr_x_data, lr_data)
+                self.ax4.relim()
+                self.ax4.autoscale_view()
+        
+        if hasattr(self, 'grad_norm_line') and self.grad_norms and len(self.losses) % 4 == 0:
+            # Ensure data arrays match x_data length and filter extreme values
+            gn_data = self.grad_norms[:len(x_data)]
+            filtered_grad_norms = [min(max(gn, 0.001), 10.0) for gn in gn_data]  # Cap between 0.001 and 10
+            gn_x_data = x_data[:len(filtered_grad_norms)]
+            
+            if filtered_grad_norms and gn_x_data and len(filtered_grad_norms) == len(gn_x_data):
+                self.grad_norm_line.set_data(gn_x_data, filtered_grad_norms)
+                if hasattr(self, 'ax4_twin'):
+                    self.ax4_twin.relim()
+                    self.ax4_twin.autoscale_view()
+        
+        # Redraw the canvas with optimized method
+        try:
+            if hasattr(self, 'fig') and hasattr(self.fig, 'canvas'):
+                # Use draw_idle for much better performance - only redraws when GUI is idle
+                self.fig.canvas.draw_idle()
+        except Exception as e:
+            self.log_to_console(f"Plot draw error: {str(e)}", "ERROR")
 
     def start_training_thread(self):
         try:
             max_iters = int(self.iters_input.get())
             plot_step_size = int(self.plot_step_input.get())
-            if max_iters <= 0 or plot_step_size <= 0:
+            batch_size = int(self.batch_size_input.get())
+            if max_iters <= 0 or plot_step_size <= 0 or batch_size <= 0:
                 raise ValueError
         except ValueError:
-            messagebox.showerror("Invalid Input", "Please enter positive integers for iterations and plot step.")
+            messagebox.showerror("Invalid Input", "Please enter positive integers for iterations, plot step, and batch size.")
             return
+
+        # Update config with the new batch size and recreate trainer if needed
+        if self.config.batch_size != batch_size:
+            self.config.batch_size = batch_size
+            
+            # Recreate trainer with updated batch size to ensure proper data loading
+            try:
+                old_trainer = self.trainer
+                self.trainer = Trainer(self.config, loss_callback=self.queue_loss, metrics_callback=self.queue_metrics)
+                
+                # Try to transfer model weights if compatible
+                if hasattr(old_trainer, 'model') and hasattr(self.trainer, 'model'):
+                    try:
+                        old_state = old_trainer.model.state_dict()
+                        new_state = self.trainer.model.state_dict()
+                        
+                        # Transfer compatible weights
+                        compatible_keys = []
+                        for key in old_state:
+                            if key in new_state and old_state[key].shape == new_state[key].shape:
+                                new_state[key] = old_state[key]
+                                compatible_keys.append(key)
+                        
+                        if compatible_keys:
+                            self.trainer.model.load_state_dict(new_state)
+                            self.log_to_console(f"Transferred {len(compatible_keys)} compatible layers to new trainer", "INFO")
+                        else:
+                            self.log_to_console("No compatible weights to transfer - using fresh model", "WARNING")
+                    except Exception as e:
+                        self.log_to_console(f"Could not transfer weights: {e}", "WARNING")
+                
+                self.log_to_console(f"Trainer recreated with batch size: {batch_size}", "INFO")
+                
+            except Exception as e:
+                self.log_to_console(f"Warning: Could not recreate trainer with new batch size: {e}", "WARNING")
+                # Fall back to just updating the config
+                if hasattr(self, 'trainer') and self.trainer:
+                    self.trainer.config.batch_size = batch_size
+        else:
+            self.log_to_console(f"Using current batch size: {batch_size}", "INFO")
 
         self.train_button.config(state="disabled")
         self.stop_button.config(state="normal")
         self.generate_button.config(state="disabled")
         self.status_text.set(f"Training for {max_iters} iterations...")
-        self.losses = []
-        self.update_plot()
-
+        
+        # Log training start
+        self.log_to_console(f"Starting training for {max_iters} iterations (plot step: {plot_step_size})", "INFO")
+        self.log_to_console(f"Model parameters: {sum(p.numel() for p in self.trainer.model.parameters()):,}", "INFO")
+        
+        # Clear previous data and reset plot
+        self.clear_plot_data()
+        
         self.progress_bar['value'] = 0
         self.progress_bar['maximum'] = max_iters
 
@@ -1176,15 +1796,32 @@ Attention Type: {self.config.attention_type}"""
         thread.daemon = True
         thread.start()
 
+    def clear_plot_data(self):
+        """Clear all plotting data arrays"""
+        self.losses = []
+        self.perplexities = []
+        self.iterations = []
+        self.learning_rates = []
+        self.grad_norms = []
+        
+        # Clear the plot immediately
+        self.update_plot()
+        
+        # Log the clearing
+        self.log_to_console("Plot data cleared for new training session", "INFO")
+
     def run_training(self, max_iters, plot_step_size):
         try:
             self.trainer.train(max_iters, plot_step_size, self.stop_training_event, self.update_progress)
             if self.stop_training_event.is_set():
                 self.root.after(0, lambda: self.status_text.set("Training stopped by user."))
+                self.root.after(0, lambda: self.log_to_console("Training stopped by user", "WARNING"))
             else:
                 self.root.after(0, lambda: self.status_text.set("Training complete. Ready."))
+                self.root.after(0, lambda: self.log_to_console("Training completed successfully!", "SUCCESS"))
         except Exception as e:
-            self.root.after(0, lambda: self.status_text.set(f"Training error: {e}"))
+            self.root.after(0, lambda error=e: self.status_text.set(f"Training error: {error}"))
+            self.root.after(0, lambda error=e: self.log_to_console(f"Training error: {str(error)}", "ERROR"))
         finally:
             self.root.after(0, lambda: self.train_button.config(state="normal"))
             self.root.after(0, lambda: self.stop_button.config(state="disabled"))
@@ -1193,6 +1830,7 @@ Attention Type: {self.config.attention_type}"""
     def stop_training(self):
         if self.stop_training_event:
             self.stop_training_event.set()
+            self.log_to_console("Training stop requested by user", "WARNING")
         self.stop_button.config(state="disabled")
 
     def update_progress(self, current_step):
@@ -1200,6 +1838,11 @@ Attention Type: {self.config.attention_type}"""
 
     def _set_progress(self, value):
         self.progress_bar['value'] = value
+        
+        # Log progress periodically
+        if value % 100 == 0 and value > 0:
+            progress_pct = (value / self.progress_bar['maximum']) * 100 if self.progress_bar['maximum'] > 0 else 0
+            self.log_to_console(f"Training progress: {value}/{self.progress_bar['maximum']} ({progress_pct:.1f}%)", "INFO")
 
     def start_generation_thread(self):
         self.generate_button.config(state="disabled")
@@ -1255,7 +1898,7 @@ Attention Type: {self.config.attention_type}"""
 
             self.root.after(0, self.update_output, generated_text)
         except Exception as e:
-            self.root.after(0, lambda: self.status_text.set(f"Error: {e}"))
+            self.root.after(0, lambda error=e: self.status_text.set(f"Error: {error}"))
         finally:
             self.root.after(0, lambda: self.generate_button.config(state="normal"))
             self.root.after(0, lambda: self.train_button.config(state="normal"))
@@ -1286,7 +1929,7 @@ Attention Type: {self.config.attention_type}"""
                 avg_loss, perplexity = self.trainer.evaluate(eval_iters)
                 self.root.after(0, self.on_evaluation_complete, avg_loss, perplexity)
             except Exception as e:
-                self.root.after(0, lambda: self.status_text.set(f"Evaluation error: {e}"))
+                self.root.after(0, lambda error=e: self.status_text.set(f"Evaluation error: {error}"))
                 self.root.after(0, lambda: self.eval_button.config(state="normal"))
         
         thread = threading.Thread(target=eval_thread)
@@ -1301,6 +1944,14 @@ Attention Type: {self.config.attention_type}"""
 
     def on_vram_profile_change(self):
         """Handle VRAM profile selection changes"""
+        # Skip during initialization
+        if hasattr(self, '_initializing') and self._initializing:
+            return
+            
+        # Prevent recursive calls
+        if hasattr(self, '_updating_vram_profile') and self._updating_vram_profile:
+            return
+        
         profile = self.vram_profile_var.get()
         
         if profile == "low":
@@ -1312,24 +1963,120 @@ Attention Type: {self.config.attention_type}"""
         else:
             info_text = ""
             
-        self.vram_info_label.config(text=info_text)
+        # Only update the label if it exists (GUI components are created)
+        if hasattr(self, 'vram_info_label'):
+            self.vram_info_label.config(text=info_text)
+        
+        # Log the VRAM profile change to console (only if console exists)
+        if hasattr(self, 'console_text') and hasattr(self, 'log_to_console'):
+            self.log_to_console(f"VRAM Profile changed to: {profile.upper()}", "INFO")
+            self.log_to_console(f"Profile settings: {info_text}", "INFO")
         
         # Update config if trainer exists
         if hasattr(self, 'trainer') and self.trainer:
             try:
+                # Set flag to prevent recursive calls
+                self._updating_vram_profile = True
+                
+                # Store old trainer reference before creating new one
+                old_trainer = self.trainer
+                
                 # Apply VRAM optimized config
-                new_config = Config.get_vram_optimized_config(profile, self.config)
+                print(f"Applying {profile.upper()} VRAM profile...")
+                print(f"Current config batch size before: {self.config.batch_size}")
+                
+                # Pass None as base_config to force creation of a fresh config with VRAM optimizations
+                new_config = Config.get_vram_optimized_config(profile, None)
+                
+                # Preserve important settings from the current config
+                new_config.vocab_size = self.config.vocab_size
+                if hasattr(self.config, 'device'):
+                    new_config.device = self.config.device
+                    
+                print(f"New config batch size after: {new_config.batch_size}")
                 self.config = new_config
+                print(f"Config updated with {profile.upper()} profile - batch size: {self.config.batch_size}")
                 
                 # Recreate trainer with new config
-                self.trainer = Trainer(self.config, self.queue_loss)
+                print("Creating new trainer with updated config...")
                 
-                # Update displays
-                self.update_hyperparameter_display()
+                # Clear GPU cache before creating new trainer
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    print("GPU cache cleared")
                 
-                print(f"Applied {profile.upper()} VRAM profile")
+                self.trainer = Trainer(self.config, loss_callback=self.queue_loss, metrics_callback=self.queue_metrics)
+                print("New trainer created successfully")
+                
+                # Try to transfer model weights if compatible
+                if hasattr(old_trainer, 'model') and hasattr(self.trainer, 'model'):
+                    try:
+                        # Check if architectures are compatible (same basic structure)
+                        old_state = old_trainer.model.state_dict()
+                        new_state = self.trainer.model.state_dict()
+                        
+                        # Transfer compatible weights
+                        compatible_weights = {}
+                        for key in new_state.keys():
+                            if key in old_state and old_state[key].shape == new_state[key].shape:
+                                compatible_weights[key] = old_state[key]
+                        
+                        if compatible_weights:
+                            self.trainer.model.load_state_dict(compatible_weights, strict=False)
+                            print(f"Transferred {len(compatible_weights)} compatible weight tensors")
+                        else:
+                            print("No compatible weights to transfer - using fresh model")
+                            
+                    except Exception as weight_error:
+                        print(f"Weight transfer failed: {weight_error}")
+                        if hasattr(self, 'console_text') and hasattr(self, 'log_to_console'):
+                            self.log_to_console(f"Weight transfer failed: {weight_error}", "WARNING")
+                
+                # Update GUI fields with new config values
+                print("Updating GUI from config...")
+                self.update_gui_from_config()
+                
+                # Update displays only if GUI components exist
+                if hasattr(self, 'hyperparam_text'):
+                    self.update_hyperparameter_display()
+                
+                print(f"Applied {profile.upper()} VRAM profile - Config and GUI updated")
+                
+                # Log success to console if available
+                if hasattr(self, 'console_text') and hasattr(self, 'log_to_console'):
+                    self.log_to_console(f"Successfully applied {profile.upper()} VRAM profile", "SUCCESS")
+                    self.log_to_console(f"New settings - Batch: {self.config.batch_size}, Layers: {self.config.n_layer}, Embedding: {self.config.n_embd}", "INFO")
+                    
             except Exception as e:
-                print(f"Error applying VRAM profile: {e}")
+                error_msg = f"Error applying VRAM profile: {e}"
+                print(error_msg)
+                
+                # Log error to console if available
+                if hasattr(self, 'console_text') and hasattr(self, 'log_to_console'):
+                    self.log_to_console(error_msg, "ERROR")
+                    self.log_to_console("VRAM profile change failed - keeping previous configuration", "WARNING")
+                
+                # Show error dialog to user
+                try:
+                    import tkinter.messagebox as messagebox
+                    messagebox.showerror("VRAM Profile Error", 
+                                       f"Failed to apply {profile.upper()} VRAM profile:\n{str(e)}\n\nKeeping previous configuration.")
+                except:
+                    pass  # Fallback if messagebox fails
+                
+                # Revert to previous profile in GUI if possible
+                try:
+                    if hasattr(self, '_last_working_profile'):
+                        self.vram_profile_var.set(self._last_working_profile)
+                except:
+                    pass
+                    
+            finally:
+                # Clear the flag
+                self._updating_vram_profile = False
+        else:
+            # Store the working profile for potential revert
+            self._last_working_profile = profile
 
     def create_advanced_tab(self):
         """Create advanced settings tab with notebook-inspired features"""
@@ -1413,7 +2160,7 @@ Attention Type: {self.config.attention_type}"""
         
         tk.Label(warmup_frame, text="Warmup Steps:").pack(side='left', padx=5)
         self.warmup_steps_entry = tk.Entry(warmup_frame, width=8)
-        self.warmup_steps_entry.insert(0, "1000")
+        self.warmup_steps_entry.insert(0, "100")
         self.warmup_steps_entry.pack(side='left', padx=5)
         
         tk.Label(warmup_frame, text="Min LR Ratio:").pack(side='left', padx=(20,5))
@@ -1430,7 +2177,7 @@ Attention Type: {self.config.attention_type}"""
         autosave_frame.pack(fill='x', pady=2)
         
         self.auto_save_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(autosave_frame, text="Auto-save with metadata", 
+        tk.Checkbutton(autosave_frame, text="Auto-save best model during training", 
                       variable=self.auto_save_var).pack(side='left', padx=5)
         
         tk.Label(autosave_frame, text="Save every:").pack(side='left', padx=(20,5))
@@ -1485,9 +2232,10 @@ Attention Type: {self.config.attention_type}"""
             # Update config with advanced settings
             self.config.use_gradient_checkpointing = self.use_checkpointing_var.get()
             self.config.warmup_iters = int(self.warmup_steps_entry.get())
+            self.config.auto_save_best = self.auto_save_var.get()  # Add auto-save setting
             
             # Create new trainer with updated config
-            self.trainer = Trainer(self.config, self.queue_loss)
+            self.trainer = Trainer(self.config, loss_callback=self.queue_loss, metrics_callback=self.queue_metrics)
             
             # Update displays
             self.update_hyperparameter_display()
@@ -1514,4 +2262,308 @@ Attention Type: {self.config.attention_type}"""
             self.perplexity_result_label.config(text="Error calculating")
             messagebox.showerror("Error", f"Failed to calculate perplexity: {e}")
 
-    # ...existing methods...
+    def start_optimization_thread(self):
+        try:
+            n_trials = int(self.trials_input.get())
+            steps_per_trial = int(self.steps_per_trial_input.get())
+            if n_trials <= 0 or steps_per_trial <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Please enter positive integers for trials and steps per trial.")
+            return
+
+        # Get architecture configuration from GUI
+        arch_config = self.get_architecture_config()
+        
+        # Get parameter configuration
+        param_config = self.get_parameter_config()
+        if param_config is None:
+            return  # Error in parameter configuration
+        
+        # Get sampler configuration
+        sampler_config = self.get_sampler_config()
+        
+        # Validate configuration
+        if arch_config.attention_type == 'grouped_query' and arch_config.n_head % arch_config.n_query_groups != 0:
+            messagebox.showerror("Invalid Configuration", 
+                               f"Number of heads ({arch_config.n_head}) must be divisible by query groups ({arch_config.n_query_groups})")
+            return
+
+        self.optimize_button.config(state="disabled")
+        self.stop_optimize_button.config(state="normal")
+        self.train_button.config(state="disabled")
+        self.generate_button.config(state="disabled")
+        
+        # Update status with configuration info
+        moe_info = f" with MoE ({arch_config.moe_num_experts} experts)" if arch_config.use_moe else ""
+        attn_info = f" using {arch_config.attention_type} attention"
+        sampler_info = f" ({sampler_config['type']} sampler)"
+        self.status_text.set(f"Starting optimization: {n_trials} trials{moe_info}{attn_info}{sampler_info}")
+        
+        # Clear log
+        self.optim_log_text.config(state="normal")
+        self.optim_log_text.delete("1.0", tk.END)
+        self.optim_log_text.insert(tk.END, f"=== HYPERPARAMETER OPTIMIZATION LOG ===\n")
+        self.optim_log_text.insert(tk.END, f"Configuration: {n_trials} trials, {steps_per_trial} steps per trial\n")
+        self.optim_log_text.insert(tk.END, f"Architecture: {arch_config.attention_type} attention{moe_info}\n")
+        self.optim_log_text.insert(tk.END, f"Sampler: {sampler_config['type']}, Pruner: {sampler_config['pruner']}\n")
+        self.optim_log_text.insert(tk.END, f"Device: {device}\n")
+        self.optim_log_text.insert(tk.END, "=" * 50 + "\n\n")
+        self.optim_log_text.config(state="disabled")
+
+        self.optim_progress_bar['value'] = 0
+        self.optim_progress_bar['maximum'] = n_trials
+
+        self.optim_queue = queue.Queue()
+        self.stop_optimization_event = threading.Event()
+        
+        thread = threading.Thread(target=self.run_optimization_thread, args=(n_trials, steps_per_trial, arch_config, param_config, sampler_config))
+        thread.daemon = True
+        thread.start()
+        
+        # Start updating the log display
+        self.root.after(100, self.process_optim_queue)
+
+    def run_optimization_thread(self, n_trials, steps_per_trial, arch_config, param_config, sampler_config):
+        """Run hyperparameter optimization in a separate thread"""
+        try:
+            # Use the optimization function from ShitGPT
+            best_config = run_hyperparameter_optimization(
+                arch_config, n_trials, steps_per_trial, 
+                param_config, self.stop_optimization_event, sampler_config
+            )
+            
+            # Update config with best parameters
+            if best_config:
+                self.config = best_config
+                self.config.vocab_size = vocab_size
+                
+                # Update GUI with best parameters
+                self.root.after(0, self.update_gui_from_config)
+                self.root.after(0, self.update_hyperparameter_display)
+                
+        except Exception as e:
+            self.root.after(0, lambda: messagebox.showerror("Optimization Error", f"Error during optimization: {e}"))
+        finally:
+            self.root.after(0, self.optimization_finished)
+
+    def process_optim_queue(self):
+        """Process optimization log queue"""
+        try:
+            while not self.optim_queue.empty():
+                message = self.optim_queue.get_nowait()
+                self.optim_log_text.config(state="normal")
+                self.optim_log_text.insert(tk.END, message + "\n")
+                self.optim_log_text.see(tk.END)
+                self.optim_log_text.config(state="disabled")
+        except:
+            pass
+        
+        if not (self.stop_optimization_event and self.stop_optimization_event.is_set()):
+            self.root.after(100, self.process_optim_queue)
+
+    def stop_optimization(self):
+        """Stop optimization"""
+        if self.stop_optimization_event:
+            self.stop_optimization_event.set()
+        self.stop_optimize_button.config(state="disabled")
+
+    def optimization_finished(self):
+        """Handle optimization completion"""
+        self.optimize_button.config(state="normal")
+        self.stop_optimize_button.config(state="disabled")
+        self.train_button.config(state="normal")
+        self.generate_button.config(state="normal")
+        self.status_text.set("Optimization complete. Ready.")
+
+    def load_model_weights(self):
+        model_path = "gpt_model.pth"
+        if os.path.exists(model_path):
+            try:
+                # Use the enhanced model loading method from Trainer
+                success = self.trainer.load_model(model_path)
+                if success:
+                    # Load hyperparameters from model if available
+                    try:
+                        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+                        if 'config' in checkpoint:
+                            # Update config with model's hyperparameters
+                            model_config = checkpoint['config']
+                            for key, value in model_config.items():
+                                if hasattr(self.config, key):
+                                    setattr(self.config, key, value)
+                        
+                        # Update GUI with loaded hyperparameters
+                        self.update_gui_from_config()
+                        self.update_hyperparameter_display()
+                        
+                        print("Model hyperparameters loaded and applied")
+                    except Exception as e:
+                        print(f"Warning: Could not load hyperparameters from model: {e}")
+                    
+                    self.status_text.set("Model and hyperparameters loaded successfully.")
+                    return True
+                else:
+                    messagebox.showwarning("Model Load Error", f"Could not load model weights from {model_path}.\nUsing a randomly initialized model.")
+            except Exception as e:
+                messagebox.showwarning("Model Load Error", f"Could not load model weights from {model_path}:\n{e}\n\nUsing a randomly initialized model.")
+        else:
+            messagebox.showwarning("Model Not Found", f"Model file '{model_path}' not found.\nThe model will have random weights and produce gibberish.")
+        return False
+
+    def show_about(self):
+        """Show about dialog with version information"""
+        version_info = get_version_info()
+        about_text = f"""DGS-GPT v{version_info['version']}
+
+{version_info['description']}
+
+Author: {version_info['author']}
+License: {version_info['license']}
+
+A modern GPT implementation featuring:
+• Advanced transformer architecture
+• Multi-head and grouped query attention
+• Mixture of Experts (MoE) support
+• Real-time training visualization
+• Hyperparameter optimization with Optuna
+• Cross-platform compatibility
+
+For more information, visit:
+https://github.com/DatGuyShorty/DGS-GPT"""
+        
+        messagebox.showinfo("About DGS-GPT", about_text)
+
+    def apply_current_settings(self):
+        """Apply current model settings to active training session"""
+        try:
+            # Update config from GUI values
+            self.config.learning_rate = float(self.lr_var.get())
+            self.config.weight_decay = float(self.wd_var.get())
+            self.config.dropout = float(self.dropout_var.get())
+            self.config.batch_size = int(self.batch_size_var.get())
+            self.config.block_size = int(self.block_size_var.get())
+            
+            # Architecture parameters
+            self.config.n_embd = int(self.embd_dim_var.get())
+            self.config.n_layer = int(self.layers_var.get())
+            self.config.n_head = int(self.heads_var.get())
+            
+            # MoE settings
+            self.config.use_moe = self.use_moe_var.get()
+            self.config.moe_num_experts = int(self.moe_experts_var.get())
+            self.config.moe_k = int(self.moe_k_var.get())
+            
+            # Attention settings
+            self.config.attention_type = self.attention_type_var.get()
+            self.config.n_query_groups = int(self.query_groups_var.get())
+            
+            # Recreate trainer with new config
+            if hasattr(self, 'trainer') and self.trainer:
+                try:
+                    old_trainer = self.trainer
+                    self.log_to_console("Recreating trainer with new settings...", "INFO")
+                    
+                    # Clear GPU cache before creating new trainer
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    
+                    # Create new trainer with updated config
+                    self.trainer = Trainer(self.config, loss_callback=self.queue_loss, metrics_callback=self.queue_metrics)
+                    
+                    # Try to transfer model weights if compatible
+                    if hasattr(old_trainer, 'model') and hasattr(self.trainer, 'model'):
+                        try:
+                            old_state = old_trainer.model.state_dict()
+                            new_state = self.trainer.model.state_dict()
+                            
+                            # Transfer compatible weights
+                            compatible_keys = []
+                            for key in old_state:
+                                if key in new_state and old_state[key].shape == new_state[key].shape:
+                                    new_state[key] = old_state[key]
+                                    compatible_keys.append(key)
+                            
+                            if compatible_keys:
+                                self.trainer.model.load_state_dict(new_state)
+                                self.log_to_console(f"Transferred {len(compatible_keys)} compatible layers", "SUCCESS")
+                            else:
+                                self.log_to_console("No compatible weights to transfer - using fresh model", "WARNING")
+                        except Exception as e:
+                            self.log_to_console(f"Could not transfer weights: {e}", "WARNING")
+                    
+                    self.log_to_console("Applied current settings to training session", "SUCCESS")
+                    
+                except Exception as e:
+                    self.log_to_console(f"Error recreating trainer: {e}", "ERROR")
+                    # Fall back to just updating the config
+                    if hasattr(self, 'trainer') and self.trainer:
+                        self.trainer.config = self.config
+                        self.log_to_console("Updated trainer config (fallback)", "WARNING")
+            else:
+                # Create new trainer if none exists
+                try:
+                    self.trainer = Trainer(self.config, loss_callback=self.queue_loss, metrics_callback=self.queue_metrics)
+                    self.log_to_console("Created new trainer with current settings", "SUCCESS")
+                except Exception as e:
+                    self.log_to_console(f"Error creating trainer: {e}", "ERROR")
+                
+            # Update GUI fields to match applied values
+            self.update_gui_from_config()
+            
+            # Update hyperparameter display
+            if hasattr(self, 'update_hyperparameter_display'):
+                self.update_hyperparameter_display()
+            
+            self.status_text.set("Settings applied successfully")
+            
+        except Exception as e:
+            error_msg = f"Error applying settings: {e}"
+            self.log_to_console(error_msg, "ERROR")
+            messagebox.showerror("Apply Settings Error", error_msg)
+
+    def reset_model_settings(self):
+        """Reset model settings to defaults"""
+        if messagebox.askyesno("Reset Settings", "Reset all model settings to defaults?"):
+            try:
+                # Reset to default config values
+                from ShitGPT import Config
+                default_config = Config()
+                
+                # Update GUI variables
+                self.lr_var.set(str(default_config.learning_rate))
+                self.wd_var.set(str(default_config.weight_decay))
+                self.dropout_var.set(str(default_config.dropout))
+                self.batch_size_var.set(str(default_config.batch_size))
+                self.block_size_var.set(str(default_config.block_size))
+                
+                # Architecture
+                self.embd_dim_var.set(str(default_config.n_embd))
+                self.layers_var.set(str(default_config.n_layer))
+                self.heads_var.set(str(default_config.n_head))
+                
+                # MoE
+                self.use_moe_var.set(default_config.use_moe)
+                self.moe_experts_var.set(str(default_config.moe_num_experts))
+                self.moe_k_var.set(str(default_config.moe_k))
+                
+                # Attention
+                self.attention_type_var.set(default_config.attention_type)
+                self.query_groups_var.set(str(default_config.n_query_groups))
+                
+                # Reset VRAM profile to low
+                self.vram_profile_var.set("low")
+                self.on_vram_profile_change()
+                
+                self.log_to_console("Reset all settings to defaults", "INFO")
+                self.status_text.set("Settings reset to defaults")
+                
+            except Exception as e:
+                error_msg = f"Error resetting settings: {e}"
+                self.log_to_console(error_msg, "ERROR")
+                messagebox.showerror("Reset Error", error_msg)
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = GPT_GUI(root)
+    root.mainloop()

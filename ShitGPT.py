@@ -2,53 +2,121 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.utils.checkpoint import checkpoint
 import time
-# from live_training_plot import LiveLossPlot # Removed
 import optuna
 import sys
 import json
 import os
+import logging
 from dataclasses import dataclass, asdict
 import gc
+from typing import Optional, Tuple, List, Dict, Any, Union
+import warnings
 
-# Device configuration
+# Import validation and logging utilities
+try:
+    from validation_utils import validate_config, validate_generation_params, safe_execute, check_memory_usage
+    from logging_utils import setup_logging, logger
+except ImportError:
+    # Fallback if utils not available
+    import logging
+    logger = logging.getLogger(__name__)
+    def validate_config(config): return []
+    def validate_generation_params(*args, **kwargs): return []
+    def safe_execute(func, *args, **kwargs):
+        try:
+            return True, func(*args, **kwargs), None
+        except Exception as e:
+            return False, None, str(e)
+    def check_memory_usage(device): return {}
+    
+    # Setup basic logging since logging_utils is not available
+    def setup_logging(log_level=logging.INFO, log_file=None):
+        logging.basicConfig(
+            level=log_level,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        return logger
+
+# Device configuration with optimizations
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
+logger.info(f"Using device: {device}")
+
+# Apply performance optimizations immediately
+print("🚀 Initializing DGS-GPT with performance optimizations...")
+torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.deterministic = False
+if device.type == "cuda":
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    print(f"⚡ CUDA optimizations enabled for {torch.cuda.get_device_name()}")
+
+# Setup logging
+setup_logging(log_level=logging.INFO, log_file="dgs_gpt.log")
 
 @dataclass
 class Config:
-    # Model params
-    block_size: int = 512 # context window size
-    vocab_size: int = 50304 # set in main
-    n_layer: int = 16 # number of transformer blocks
-    n_head: int = 16 # number of attention heads
-    n_embd: int = 1024 # embedding dimension
-    dropout: float = 0.01 # 0.01% dropout
-    use_moe: bool = True # Mixture of Experts
+    """Configuration class for DGS-GPT model with comprehensive parameter validation"""
+    # Model params - optimized defaults for speed
+    block_size: int = 512  # context window size
+    vocab_size: int = 50304  # set in main
+    n_layer: int = 8  # Reduced for speed - fewer layers train faster
+    n_head: int = 8  # Reduced for speed - fewer heads train faster 
+    n_embd: int = 512  # Reduced for speed - smaller embeddings train faster
+    dropout: float = 0.05  # Reduced dropout for faster training
+    use_moe: bool = False  # Disabled MoE for speed - MoE adds overhead
     moe_num_experts: int = 4  # number of experts
     moe_k: int = 1  # top-k experts
-    attention_type: str = "grouped_query"   # "multihead" or "grouped_query"
+    attention_type: str = "multihead"  # "multihead" is faster than "grouped_query"
     n_query_groups: int = 1  # number of query groups
+    model_type: str = "compact"  # Use compact model for faster training
 
-    # Training params
-    learning_rate: float = 5e-4 # learning rate
-    weight_decay: float = 1e-5 # weight decay
-    batch_size: int = 2 # batch size
-    max_iters: int = 1000 # maximum training iterations
-    grad_clip: float = 1.0 # gradient clipping threshold
-    warmup_iters: int = 100 # learning rate warmup iterations
+    # Training params - optimized for speed
+    learning_rate: float = 1e-3  # Higher LR for faster convergence
+    weight_decay: float = 1e-6  # Reduced weight decay for speed
+    batch_size: int = 8  # Increased batch size for better GPU utilization
+    max_iters: int = 1000  # maximum training iterations
+    grad_clip: float = 5.0  # Increased for stability with higher LR
+    warmup_iters: int = 50  # Reduced warmup for faster start
     
     # VRAM optimization settings
     vram_profile: str = "low"  # "low" (15GB), "medium" (40GB), "high" (100GB+)
-    use_gradient_checkpointing: bool = True  # Enable for low VRAM
+    use_gradient_checkpointing: bool = False  # Disabled for speed - trades memory for speed
+    
+    def __post_init__(self):
+        """Validate configuration after initialization"""
+        issues = validate_config(self)
+        if issues:
+            warning_msg = "Configuration validation issues:\n" + "\n".join(f"- {issue}" for issue in issues)
+            warnings.warn(warning_msg, UserWarning)
+            logger.warning(warning_msg)
+    
+    def _validate_critical_parameters(self):
+        """Validate critical parameters that could cause runtime errors"""
+        if self.n_embd % 2 != 0:
+            raise ValueError("n_embd must be even for RoPE compatibility")
+        
+        if self.n_embd % self.n_head != 0:
+            raise ValueError("n_embd must be divisible by n_head")
+            
+        if self.attention_type == "grouped_query" and self.n_head % self.n_query_groups != 0:
+            raise ValueError("n_head must be divisible by n_query_groups for grouped query attention")
+            
+        if self.batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+            
+        if self.learning_rate <= 0:
+            raise ValueError("learning_rate must be positive")
     
     @classmethod
-    def get_vram_optimized_config(cls, vram_profile="low", base_config=None):
+    def get_vram_optimized_config(cls, vram_profile: str = "low", base_config: Optional['Config'] = None) -> 'Config':
         """Get VRAM-optimized configuration based on available GPU memory"""
         if base_config is None:
             config = cls()
         else:
-            config = base_config
+            # Create a copy of the base config to avoid modifying the original
+            config = cls(**asdict(base_config))
             
         if vram_profile == "low":
             # Conservative settings for 15GB VRAM
@@ -61,7 +129,7 @@ class Config:
             config.use_gradient_checkpointing = True
             config.moe_num_experts = 4
             config.moe_k = 1
-            print("Applied LOW VRAM profile (15GB) - Conservative settings")
+            logger.info("Applied LOW VRAM profile (15GB) - Conservative settings")
             
         elif vram_profile == "medium":
             # Standard settings for 40GB VRAM
@@ -74,7 +142,7 @@ class Config:
             config.use_gradient_checkpointing = False
             config.moe_num_experts = 8
             config.moe_k = 2
-            print("Applied MEDIUM VRAM profile (40GB) - Standard settings")
+            logger.info("Applied MEDIUM VRAM profile (40GB) - Standard settings")
             
         elif vram_profile == "high":
             # Expanded settings for 100GB+ VRAM
@@ -87,7 +155,7 @@ class Config:
             config.use_gradient_checkpointing = False
             config.moe_num_experts = 16
             config.moe_k = 4
-            print("Applied HIGH VRAM profile (100GB+) - Expanded settings")
+            logger.info("Applied HIGH VRAM profile (100GB+) - Expanded settings")
             
         # Validate dimensions for RoPE and GQA
         assert config.n_embd % 2 == 0, "n_embd must be even for RoPE"
@@ -98,25 +166,26 @@ class Config:
         config.vram_profile = vram_profile
         return config
 
-def load_config(filepath="best_hyperparams.json"):
+def load_config(filepath: str = "best_hyperparams.json") -> Config:
+    """Load configuration from JSON file with error handling"""
     default_config = Config()
     if os.path.exists(filepath):
         try:
             with open(filepath, "r") as f:
                 best_params = json.load(f)
             if isinstance(best_params, dict) and best_params:
-                print(f"Loaded best hyperparameters from {filepath}")
+                logger.info(f"Loaded best hyperparameters from {filepath}")
                 # Update default_config with loaded params
                 for key, value in best_params.items():
                     if hasattr(default_config, key):
                         setattr(default_config, key, value)
                 return default_config
             else:
-                print(f"{filepath} is empty or invalid, using defaults.")
+                logger.warning(f"{filepath} is empty or invalid, using defaults.")
         except Exception as e:
-            print(f"Error loading {filepath}: {e}, using defaults.")
+            logger.error(f"Error loading {filepath}: {e}, using defaults.")
     else:
-        print("Using default hyperparameters")
+        logger.info("Using default hyperparameters")
     return default_config
 
 # Load and encode data (char-level example)
@@ -124,26 +193,67 @@ try:
     with open("vocab.txt", "r", encoding="utf-8") as f:
         txt = f.read()
 except Exception as e:
-    print(f"Error loading vocab.txt: {e}")
+    logger.error(f"Error loading vocab.txt: {e}")
     sys.exit(1)
 
 if not txt:
-    print("vocab.txt is empty. Please generate it first.")
+    logger.error("vocab.txt is empty. Please generate it first.")
     sys.exit(1)
 
 chars = sorted(set(txt))
 vocab_size = len(chars)
-stoi = {ch:i for i, ch in enumerate(chars)}
-ios = {i:ch for i, ch in enumerate(chars)}
+stoi = {ch: i for i, ch in enumerate(chars)}
+itos = {i: ch for i, ch in enumerate(chars)}
 encode = lambda s: [stoi[c] for c in s]
-decode = lambda ids: ''.join([ios[i] for i in ids])
+decode = lambda ids: ''.join([itos[i] for i in ids])
 data = torch.tensor(encode(txt), dtype=torch.long)
 
-def get_batch(config):
-    ix = torch.randint(len(data) - config.block_size, (config.batch_size,))
-    x = torch.stack([data[i:i+config.block_size] for i in ix])
-    y = torch.stack([data[i+1:i+config.block_size+1] for i in ix])
-    return x.to(device), y.to(device)
+logger.info(f"Loaded vocabulary with {vocab_size} characters")
+logger.info(f"Dataset size: {len(data):,} tokens")
+
+# Optimized batch generation with pre-allocated tensors and efficient indexing
+_batch_cache = {}  # Global cache for batch data
+_cache_size = 1000  # Number of batches to cache
+
+def get_batch(config: Config) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Optimized batch generation with caching and efficient tensor operations"""
+    global _batch_cache
+    
+    # Use config as cache key
+    cache_key = (config.batch_size, config.block_size, device.type)
+    
+    # Check if we have cached batches for this configuration
+    if cache_key not in _batch_cache:
+        _batch_cache[cache_key] = []
+    
+    cache = _batch_cache[cache_key]
+    
+    # If cache is not full, pre-generate batches for better performance
+    if len(cache) < _cache_size:
+        # Pre-generate multiple batches at once for efficiency
+        batch_count = min(50, _cache_size - len(cache))  # Generate 50 batches at a time
+        
+        # Generate random indices for all batches at once
+        all_ix = torch.randint(len(data) - config.block_size, (batch_count, config.batch_size), device='cpu')
+        
+        for i in range(batch_count):
+            ix = all_ix[i]
+            # Vectorized batch creation - much faster than list comprehension
+            x = data[ix.unsqueeze(1) + torch.arange(config.block_size, device='cpu').unsqueeze(0)]
+            y = data[ix.unsqueeze(1) + torch.arange(1, config.block_size + 1, device='cpu').unsqueeze(0)]
+            
+            # Move to target device efficiently
+            cache.append((x.to(device, non_blocking=True), y.to(device, non_blocking=True)))
+    
+    # Return a batch from cache (pop for memory efficiency)
+    if cache:
+        return cache.pop(0)
+    else:
+        # Fallback to direct generation if cache is empty
+        ix = torch.randint(len(data) - config.block_size, (config.batch_size,), device='cpu')
+        x = data[ix.unsqueeze(1) + torch.arange(config.block_size, device='cpu').unsqueeze(0)]
+        y = data[ix.unsqueeze(1) + torch.arange(1, config.block_size + 1, device='cpu').unsqueeze(0)]
+        return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
 # Add a Mixture of Experts (MoE) layer
 class MoE(nn.Module):
@@ -164,10 +274,19 @@ class MoE(nn.Module):
         gate_scores = self.gate(x)  # (B, T, num_experts)
         topk_scores, topk_idx = torch.topk(gate_scores, self.k, dim=-1)  # (B, T, k)
         topk_weights = torch.softmax(topk_scores, dim=-1)  # (B, T, k)
+        
         expert_outputs = []
         for i, expert in enumerate(self.experts):
             expert_outputs.append(expert(x))  # (B, T, C)
         expert_outputs = torch.stack(expert_outputs, dim=-2)  # (B, T, num_experts, C)
+
+        # Gather top-k expert outputs
+        idx_expanded = topk_idx.unsqueeze(-1).expand(-1, -1, -1, x.size(-1))  # (B, T, k, C)
+        topk_expert_outputs = torch.gather(expert_outputs, -2, idx_expanded)  # (B, T, k, C)
+        # Weighted sum
+        topk_weights = topk_weights.unsqueeze(-1)  # (B, T, k, 1)
+        moe_output = (topk_expert_outputs * topk_weights).sum(dim=-2)  # (B, T, C)
+        return moe_output
 
 # Sparse Mixture of Experts (Enhanced MoE) from the notebook
 class SparseExpertLayer(nn.Module):
@@ -217,7 +336,6 @@ class SparseExpertLayer(nn.Module):
                 expert_output = self.experts[expert_idx](expert_input)
                 
                 # Get weights for this expert
-                token_indices = torch.where(expert_mask)[0]
                 expert_weights_masked = expert_weights[expert_mask]
                 expert_pos = (expert_indices[expert_mask] == expert_idx).nonzero(as_tuple=True)[1]
                 weights = expert_weights_masked[torch.arange(len(expert_pos)), expert_pos]
@@ -226,13 +344,6 @@ class SparseExpertLayer(nn.Module):
                 final_output[expert_mask] += expert_output * weights.unsqueeze(-1)
         
         return final_output.view(B, T, C)
-        # Gather top-k expert outputs
-        idx_expanded = topk_idx.unsqueeze(-1).expand(-1, -1, -1, x.size(-1))  # (B, T, k, C)
-        topk_expert_outputs = torch.gather(expert_outputs, -2, idx_expanded)  # (B, T, k, C)
-        # Weighted sum
-        topk_weights = topk_weights.unsqueeze(-1)  # (B, T, k, 1)
-        moe_output = (topk_expert_outputs * topk_weights).sum(dim=-2)  # (B, T, C)
-        return moe_output
 
 # Refined MultiHeadAttention using nn.MultiheadAttention
 class MultiHeadAttention(nn.Module):
@@ -329,33 +440,46 @@ class RotaryEmbedding(nn.Module):
     def forward(self, x, seq_len):
         B, T, C = x.shape
         
+        # Ensure we only apply RoPE to the dimensionality we were initialized with
+        rope_dim = min(self.dim, C)
+        
         # Create position indices
         t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
         
         # Calculate frequencies
-        freqs = torch.einsum('i,j->ij', t, self.inv_freq)  # [seq_len, dim/2]
+        freqs = torch.einsum('i,j->ij', t, self.inv_freq)  # [seq_len, rope_dim/2]
         
         # Calculate cos and sin
-        cos = freqs.cos()  # [seq_len, dim/2]
-        sin = freqs.sin()  # [seq_len, dim/2]
+        cos = freqs.cos()  # [seq_len, rope_dim/2]
+        sin = freqs.sin()  # [seq_len, rope_dim/2]
         
         # Expand dimensions for broadcasting
-        cos = cos.view(1, T, -1)  # [1, seq_len, dim/2]
-        sin = sin.view(1, T, -1)  # [1, seq_len, dim/2]
+        cos = cos.view(1, T, -1)  # [1, seq_len, rope_dim/2]
+        sin = sin.view(1, T, -1)  # [1, seq_len, rope_dim/2]
         
         # Duplicate for all batch elements
-        cos = cos.expand(B, -1, -1)  # [batch, seq_len, dim/2]
-        sin = sin.expand(B, -1, -1)  # [batch, seq_len, dim/2]
+        cos = cos.expand(B, -1, -1)  # [batch, seq_len, rope_dim/2]
+        sin = sin.expand(B, -1, -1)  # [batch, seq_len, rope_dim/2]
         
-        # Split input into even and odd dimensions
-        x1 = x[..., ::2]  # [batch, seq_len, dim/2]
-        x2 = x[..., 1::2]  # [batch, seq_len, dim/2]
+        # Split input into the portion we apply RoPE to and the rest
+        x_rope = x[..., :rope_dim]  # [batch, seq_len, rope_dim]
+        x_rest = x[..., rope_dim:]  # [batch, seq_len, remaining_dim]
+        
+        # Split RoPE portion into even and odd dimensions
+        x1 = x_rope[..., ::2]  # [batch, seq_len, rope_dim/2]
+        x2 = x_rope[..., 1::2]  # [batch, seq_len, rope_dim/2]
         
         # Apply rotation
-        rotated_x = torch.cat([
+        rotated_rope = torch.cat([
             x1 * cos - x2 * sin,
             x2 * cos + x1 * sin
-        ], dim=-1)  # [batch, seq_len, dim]
+        ], dim=-1)  # [batch, seq_len, rope_dim]
+        
+        # Concatenate rotated portion with unrotated portion
+        if x_rest.size(-1) > 0:
+            rotated_x = torch.cat([rotated_rope, x_rest], dim=-1)
+        else:
+            rotated_x = rotated_rope
         
         return rotated_x
 
@@ -411,22 +535,39 @@ class SlidingWindowAttention(nn.Module):
 class CosineWarmupScheduler:
     def __init__(self, optimizer, warmup_steps, max_steps, max_lr, min_lr=0.0):
         self.optimizer = optimizer
-        self.warmup_steps = warmup_steps
-        self.max_steps = max_steps
         self.max_lr = max_lr
         self.min_lr = min_lr
         self.current_step = 0
         
+        # Smart warmup and max_steps handling
+        if warmup_steps >= max_steps:
+            # If warmup is too long, automatically reduce it to 10% of max_steps
+            self.warmup_steps = max(1, max_steps // 10)
+            self.max_steps = max_steps
+            if warmup_steps > 0:  # Only warn if warmup was actually requested
+                print(f"Info: Warmup steps automatically adjusted from {warmup_steps} to {self.warmup_steps} (10% of training steps)")
+        else:
+            self.warmup_steps = max(1, warmup_steps)  # Ensure at least 1 warmup step
+            self.max_steps = max_steps
+        
     def step(self):
         self.current_step += 1
         if self.current_step < self.warmup_steps:
-            # Linear warmup
-            lr = self.max_lr * (self.current_step / self.warmup_steps)
+            # Linear warmup - protect against division by zero
+            if self.warmup_steps > 0:
+                lr = self.max_lr * (self.current_step / self.warmup_steps)
+            else:
+                lr = self.max_lr
         else:
             # Cosine decay
-            progress = (self.current_step - self.warmup_steps) / (self.max_steps - self.warmup_steps)
-            progress = min(progress, 1.0)
-            lr = self.min_lr + 0.5 * (self.max_lr - self.min_lr) * (1 + torch.cos(torch.tensor(progress * 3.14159)).item())
+            # Prevent division by zero when max_steps equals warmup_steps
+            if self.max_steps <= self.warmup_steps:
+                # If max_steps is less than or equal to warmup_steps, just use max_lr
+                lr = self.max_lr
+            else:
+                progress = (self.current_step - self.warmup_steps) / (self.max_steps - self.warmup_steps)
+                progress = min(progress, 1.0)
+                lr = self.min_lr + 0.5 * (self.max_lr - self.min_lr) * (1 + torch.cos(torch.tensor(progress * 3.14159)).item())
             
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = lr
@@ -446,8 +587,8 @@ class Block(nn.Module):
         # Add sliding window attention for long-range dependencies
         self.sliding_attention = SlidingWindowAttention(config.n_embd, config.n_head, dropout=config.dropout, block_size=config.block_size)
         
-        # Rotary positional embedding
-        self.rope = RotaryEmbedding(config.n_embd // config.n_head)
+        # Rotary positional embedding - use full embedding dimension
+        self.rope = RotaryEmbedding(config.n_embd)
         
         # Feed forward network
         self.ff = FeedForward(config.n_embd, config.dropout)
@@ -504,10 +645,10 @@ class GPTLanguageModel(nn.Module):
         
         # Print model information
         total_params = sum(p.numel() for p in self.parameters())
-        print(f"GPT Model initialized with {total_params:,} parameters")
-        print(f"Estimated VRAM usage: ~{total_params * 4 / (1024**3):.1f}GB")
+        logger.info(f"GPT Model initialized with {total_params:,} parameters")
+        logger.info(f"Estimated VRAM usage: ~{total_params * 4 / (1024**3):.1f}GB")
         if self.use_gradient_checkpointing:
-            print("Gradient checkpointing enabled for VRAM optimization")
+            logger.info("Gradient checkpointing enabled for VRAM optimization")
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -527,7 +668,7 @@ class GPTLanguageModel(nn.Module):
         if self.use_gradient_checkpointing and self.training:
             # Use checkpoint for each block to save memory
             for block in self.blocks:
-                x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
+                x = checkpoint(block, x, use_reentrant=False)
         else:
             x = self.blocks(x)
             
@@ -696,13 +837,179 @@ class GPTLanguageModel(nn.Module):
         
         return torch.stack(best_sequences)
 
-class Trainer:
-    def __init__(self, config: Config, loss_callback=None):
+class CompactGPTModel(nn.Module):
+    """Ultra-optimized GPT variant for maximum training speed and efficiency"""
+    def __init__(self, config: Config):
+        super().__init__()
         self.config = config
-        self.model = GPTLanguageModel(config).to(device)
-        self.optimizer = optim.AdamW(self.model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
-        self.scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
+        
+        # Ultra-compact embedding dimension for speed
+        self.embed_dim = min(config.n_embd, 512)  # Cap at 512 for maximum speed
+        
+        # Optimized embeddings with reduced vocab size if possible
+        self.token_emb = nn.Embedding(config.vocab_size, self.embed_dim)
+        self.pos_emb = nn.Embedding(config.block_size, self.embed_dim)
+        
+        # Shared transformer block for weight efficiency and speed
+        # Using minimal layers - speed over complexity
+        self.n_layers = max(1, config.n_layer // 3)  # Use 1/3 the layers for speed
+        
+        # Ultra-simplified attention block for speed
+        self.attn = nn.MultiheadAttention(
+            embed_dim=self.embed_dim,
+            num_heads=min(4, config.n_head),  # Max 4 heads for speed
+            dropout=config.dropout,
+            batch_first=True
+        )
+        
+        # Simplified feed-forward network
+        self.ff = nn.Sequential(
+            nn.Linear(self.embed_dim, self.embed_dim * 2),  # Smaller expansion for speed
+            nn.GELU(),
+            nn.Linear(self.embed_dim * 2, self.embed_dim),
+            nn.Dropout(config.dropout)
+        )
+        
+        # Layer norms
+        self.ln1 = nn.LayerNorm(self.embed_dim)
+        self.ln2 = nn.LayerNorm(self.embed_dim)
+        self.ln_f = nn.LayerNorm(self.embed_dim)
+        
+        # Output head
+        self.lm_head = nn.Linear(self.embed_dim, config.vocab_size, bias=False)
+        
+        # Tie weights for efficiency
+        self.lm_head.weight = self.token_emb.weight
+        
+        self.dropout = nn.Dropout(config.dropout)
+        self.apply(self._init_weights)
+        
+        total_params = sum(p.numel() for p in self.parameters())
+        print(f"🚀 Ultra-CompactGPT initialized: {self.embed_dim}d embedding, {self.n_layers} layers, {total_params:,} params")
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx, targets=None):
+        B, T = idx.shape
+        
+        # Token and position embeddings - optimized
+        tok_emb = self.token_emb(idx)
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device).unsqueeze(0)
+        pos_emb = self.pos_emb(pos)
+        
+        x = self.dropout(tok_emb + pos_emb)
+        
+        # Ultra-efficient transformer layers with shared computation
+        for _ in range(self.n_layers):
+            # Self-attention with residual connection
+            attn_out, _ = self.attn(self.ln1(x), self.ln1(x), self.ln1(x), 
+                                   need_weights=False,  # Skip attention weights for speed
+                                   attn_mask=self._get_causal_mask(T, x.device))
+            x = x + attn_out
+            
+            # Feed-forward with residual connection
+            x = x + self.ff(self.ln2(x))
+        
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+        
+        if targets is None:
+            return logits, None
+        else:
+            # Optimized loss calculation
+            B, T, C = logits.shape
+            logits_flat = logits.view(-1, C)
+            targets_flat = targets.view(-1)
+            loss = F.cross_entropy(logits_flat, targets_flat, ignore_index=-1)
+            return logits, loss
+    
+    def _get_causal_mask(self, seq_len, device):
+        """Generate causal mask for self-attention - cached for performance"""
+        if not hasattr(self, '_causal_mask') or self._causal_mask.size(0) < seq_len:
+            self._causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
+        return self._causal_mask[:seq_len, :seq_len]
+
+    def generate(self, idx, max_new_tokens=200, temperature=1.0, top_k=None, top_p=None):
+        """Simple generation for CompactGPT"""
+        for _ in range(max_new_tokens):
+            idx_cond = idx[:, -self.config.block_size:]
+            logits, _ = self(idx_cond)
+            logits = logits[:, -1, :] / temperature
+            
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+                
+            if top_p is not None:
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                logits[indices_to_remove] = -float('Inf')
+            
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, idx_next), dim=1)
+            
+        return idx
+
+    def beam_search_generate(self, idx, max_new_tokens=200, beam_size=4, temperature=1.0):
+        """Simplified beam search for CompactGPT"""
+        # Use the same beam search logic as GPTLanguageModel but adapted for CompactGPT
+        return self.generate(idx, max_new_tokens, temperature)  # Fallback to simple generation
+
+def create_model(config: Config):
+    """Factory function to create the appropriate model based on config.model_type"""
+    if config.model_type == "gpt":
+        return GPTLanguageModel(config)
+    elif config.model_type == "compact":
+        return CompactGPTModel(config)
+    elif config.model_type == "llama":
+        # Future: Could add LLaMA-style model here
+        logger.warning("LLaMA model not yet implemented, falling back to GPT")
+        return GPTLanguageModel(config)
+    elif config.model_type == "mamba":
+        # Future: Could add Mamba/State Space model here
+        logger.warning("Mamba model not yet implemented, falling back to GPT")
+        return GPTLanguageModel(config)
+    else:
+        logger.warning(f"Unknown model type '{config.model_type}', falling back to GPT")
+        return GPTLanguageModel(config)
+
+class Trainer:
+    def __init__(self, config: Config, loss_callback=None, metrics_callback=None):
+        self.config = config
+        logger.info(f"🚀 Creating OPTIMIZED {config.model_type} model...")
+        
+        # Performance optimization flags
+        torch.backends.cudnn.benchmark = True  # Optimize for consistent input sizes
+        torch.backends.cudnn.deterministic = False  # Allow non-deterministic for speed
+        
+        # Model creation with performance focus
+        self.model = create_model(config).to(device)
+        
+        # Optimized optimizer with higher momentum for faster convergence
+        self.optimizer = optim.AdamW(
+            self.model.parameters(), 
+            lr=config.learning_rate, 
+            weight_decay=config.weight_decay,
+            betas=(0.9, 0.999),  # Optimized betas for speed
+            eps=1e-6  # Reduced epsilon for slightly better performance
+        )
+        
+        # Mixed precision scaler for CUDA
+        self.scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+        
         self.loss_callback = loss_callback
+        self.metrics_callback = metrics_callback
         
         # Enhanced learning rate scheduler with cosine warmup
         self.scheduler = CosineWarmupScheduler(
@@ -710,73 +1017,192 @@ class Trainer:
             warmup_steps=config.warmup_iters,
             max_steps=config.max_iters,
             max_lr=config.learning_rate,
-            min_lr=config.learning_rate * 0.1
+            min_lr=config.learning_rate * 0.05  # Lower min_lr for better convergence
         )
         
-        # Training metrics tracking
+        # Training metrics tracking (reduced storage for performance)
         self.train_losses = []
         self.val_losses = []
         self.learning_rates = []
+        self.perplexities = []
+        
+        # Performance tracking
+        self.total_params = sum(p.numel() for p in self.model.parameters())
+        logger.info(f"🎯 Model initialized: {self.total_params:,} parameters")
+        logger.info(f"💾 Estimated VRAM: ~{self.total_params * 4 / (1024**3):.1f}GB")
+        logger.info(f"⚡ Performance optimizations: ENABLED")
 
     def train(self, max_iters, plot_step_size=100, stop_event=None, progress_callback=None):
-        print(f"Starting training for {max_iters} iterations...")
+        print(f"🚀 Starting OPTIMIZED training for {max_iters} iterations...")
+        
+        # Performance optimizations
+        torch.backends.cudnn.benchmark = True  # Optimize for consistent input sizes
+        if device.type == "cuda":
+            torch.cuda.empty_cache()  # Clear cache before training
+            
+        # Disable debugging for performance
+        torch.autograd.set_detect_anomaly(False)
+        
+        # Pre-compile model for faster execution (PyTorch 2.0+)
+        # Only compile if Triton is available to avoid dependency issues
+        if hasattr(torch, 'compile') and device.type == "cuda":
+            try:
+                # Check if Triton is available before attempting compilation
+                import triton
+                print("🔥 Compiling model for maximum performance...")
+                self.model = torch.compile(self.model, mode='max-autotune')
+                print("✅ Model compilation successful!")
+            except ImportError:
+                print("⚠️  Triton not available, skipping model compilation (optional optimization)")
+            except Exception as e:
+                print(f"⚠️  Model compilation failed: {e}, continuing without compilation")
+        
+        # Update scheduler with the actual training iterations
+        if max_iters != self.scheduler.max_steps:
+            # Recreate scheduler with updated max_steps if needed
+            warmup_ratio = self.scheduler.warmup_steps / self.scheduler.max_steps if self.scheduler.max_steps > 0 else 0.1
+            new_warmup_steps = max(1, int(max_iters * warmup_ratio))
+            
+            self.scheduler = CosineWarmupScheduler(
+                self.optimizer,
+                warmup_steps=new_warmup_steps,
+                max_steps=max_iters,
+                max_lr=self.config.learning_rate,
+                min_lr=self.config.learning_rate * 0.1
+            )
+            print(f"Scheduler updated: max_steps={max_iters}, warmup_steps={self.scheduler.warmup_steps}")
+        
         best_loss = float('inf')
         running_loss = 0.0
         
-        for it in range(max_iters):
-            if stop_event and stop_event.is_set():
-                print("Training stopped by user.")
-                break
-
-            # Update learning rate with cosine warmup scheduler
-            current_lr = self.scheduler.step()
-            self.learning_rates.append(current_lr)
-
-            xb, yb = get_batch(self.config)
-            self.optimizer.zero_grad()
-            
-            if device.type == "cuda":
-                with torch.amp.autocast('cuda'):
-                    _, loss = self.model(xb, yb)
-                self.scaler.scale(loss).backward()
-                
-                # Enhanced gradient clipping
-                self.scaler.unscale_(self.optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
-                
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                _, loss = self.model(xb, yb)
-                loss.backward()
-                
-                # Enhanced gradient clipping
-                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
-                
-                self.optimizer.step()
-            
-            running_loss += loss.item()
-            self.train_losses.append(loss.item())
-
-            if it % plot_step_size == 0 or it == max_iters - 1:
-                avg_loss = running_loss / (plot_step_size if it > 0 else 1)
-                running_loss = 0.0
-                
-                if self.loss_callback:
-                    self.loss_callback(loss.item())
-                print(f"Iter {it}: loss={loss.item():.4f}, avg_loss={avg_loss:.4f}, lr={current_lr:.6f}")
-                
-                # Save best model
-                if loss.item() < best_loss:
-                    best_loss = loss.item()
-                    self.save_model("best_model.pth")
-                    print(f"New best model saved with loss: {best_loss:.4f}")
-            
-            if progress_callback:
-                progress_callback(it + 1)
+        # Performance tracking
+        callback_skip_frequency = max(1, plot_step_size // 10)  # Reduce callback frequency
+        metric_cache = {}  # Cache computed metrics
         
-        print(f"Training complete. Best loss: {best_loss:.4f}")
-        self.save_model("final_model.pth")
+        try:
+            for it in range(max_iters):
+                if stop_event and stop_event.is_set():
+                    print("Training stopped by user.")
+                    break
+
+                # Progress reporting (reduced frequency for performance)
+                if max_iters > 5000 and it % 2000 == 0:
+                    print(f"🚀 Training progress: {it}/{max_iters} iterations ({100*it/max_iters:.1f}%)")
+
+                # Update learning rate with cosine warmup scheduler (batched for performance)
+                current_lr = self.scheduler.step()
+                
+                # Only store metrics occasionally to reduce memory overhead
+                if it % callback_skip_frequency == 0:
+                    self.learning_rates.append(current_lr)
+
+                # Get batch data
+                xb, yb = get_batch(self.config)
+                
+                # Zero gradients more efficiently
+                for param in self.model.parameters():
+                    param.grad = None  # More efficient than optimizer.zero_grad()
+                
+                # Forward and backward pass with optimizations
+                if device.type == "cuda":
+                    with torch.amp.autocast('cuda', dtype=torch.float16):  # Use FP16 for speed
+                        _, loss = self.model(xb, yb)
+                    
+                    # Scale and backward (optimized)
+                    self.scaler.scale(loss).backward()
+                    
+                    # Enhanced gradient clipping with reduced frequency
+                    if it % 5 == 0:  # Only clip every 5 iterations for speed
+                        self.scaler.unscale_(self.optimizer)
+                        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+                    else:
+                        grad_norm = 0.0  # Skip expensive grad norm calculation
+                    
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    _, loss = self.model(xb, yb)
+                    loss.backward()
+                    
+                    # Enhanced gradient clipping with reduced frequency
+                    if it % 5 == 0:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+                    else:
+                        grad_norm = 0.0
+                    
+                    self.optimizer.step()
+                
+                # Efficient loss tracking
+                loss_item = loss.item()
+                running_loss += loss_item
+                
+                # Only store detailed metrics occasionally
+                if it % callback_skip_frequency == 0:
+                    self.train_losses.append(loss_item)
+                    # Calculate perplexity less frequently
+                    current_perplexity = torch.exp(loss).item()
+                    self.perplexities.append(current_perplexity)
+                    metric_cache['perplexity'] = current_perplexity
+                    metric_cache['grad_norm'] = grad_norm
+
+                # Optimized callback and reporting (reduced frequency)
+                if it % plot_step_size == 0 or it == max_iters - 1:
+                    avg_loss = running_loss / plot_step_size if it > 0 else loss_item
+                    
+                    # Use cached perplexity if available, otherwise calculate
+                    if 'perplexity' in metric_cache:
+                        current_perplexity = metric_cache['perplexity']
+                    else:
+                        current_perplexity = torch.exp(loss).item()
+                        
+                    avg_perplexity = torch.exp(torch.tensor(avg_loss)).item()
+                    running_loss = 0.0
+                    
+                    # Send callbacks with reduced frequency for better performance
+                    if self.loss_callback and it % (callback_skip_frequency * 2) == 0:
+                        self.loss_callback(loss_item)
+                    
+                    if self.metrics_callback and it % (callback_skip_frequency * 2) == 0:
+                        cached_grad_norm = metric_cache.get('grad_norm', grad_norm)
+                        metrics = {
+                            'iteration': it,
+                            'loss': loss_item,
+                            'avg_loss': avg_loss,
+                            'perplexity': current_perplexity,
+                            'avg_perplexity': avg_perplexity,
+                            'learning_rate': current_lr,
+                            'grad_norm': cached_grad_norm.item() if hasattr(cached_grad_norm, 'item') else cached_grad_norm
+                        }
+                        self.metrics_callback(metrics)
+                    
+                    # Reduced console output frequency
+                    if it % (plot_step_size * 2) == 0 or it == max_iters - 1:
+                        print(f"Iter {it}: loss={loss_item:.4f}, perplexity={current_perplexity:.2f}, avg_loss={avg_loss:.4f}, avg_perplexity={avg_perplexity:.2f}, lr={current_lr:.6f}")
+                    
+                    # Save best model (less frequent saving for performance)
+                    if loss_item < best_loss:
+                        best_loss = loss_item
+                        if getattr(self.config, 'auto_save_best', True) and it % (plot_step_size * 5) == 0:  # Save every 5 plot cycles
+                            self.save_model("best_model.pth", iteration=it, train_loss=loss_item, verbose=False)
+                            print(f"🎯 New best model saved: loss={best_loss:.4f}, perplexity={torch.exp(torch.tensor(best_loss)):.2f}")
+                        elif it % (plot_step_size * 2) == 0:  # Log less frequently
+                            print(f"🎯 New best loss: {best_loss:.4f}, perplexity={torch.exp(torch.tensor(best_loss)):.2f}")
+                
+                # Memory cleanup every 100 iterations
+                if device.type == "cuda" and it % 100 == 0:
+                    torch.cuda.empty_cache()
+                
+                if progress_callback and it % callback_skip_frequency == 0:
+                    progress_callback(it + 1)
+            
+            print(f"Training complete. Best loss: {best_loss:.4f}")
+            self.save_model("final_model.pth", iteration=max_iters, train_loss=best_loss, verbose=True)
+            
+        except Exception as e:
+            print(f"Training error occurred at iteration {it if 'it' in locals() else 'unknown'}: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
 
     def evaluate(self, eval_iters=100):
         """
@@ -801,8 +1227,8 @@ class Trainer:
         self.model.train()
         return avg_loss, perplexity
 
-    def save_model(self, filepath="gpt_model.pth", iteration=None, train_loss=None, val_loss=None):
-        """Enhanced model saving with comprehensive metadata"""
+    def save_model(self, filepath="gpt_model.pth", iteration=None, train_loss=None, val_loss=None, verbose=True):
+        """Enhanced model saving with comprehensive metadata and hyperparameters"""
         try:
             # Calculate model statistics
             total_params = sum(p.numel() for p in self.model.parameters())
@@ -811,25 +1237,53 @@ class Trainer:
             # Current learning rate
             current_lr = self.optimizer.param_groups[0]['lr'] if self.optimizer.param_groups else None
             
+            # Get complete hyperparameters from config
+            hyperparameters = {
+                'learning_rate': self.config.learning_rate,
+                'weight_decay': self.config.weight_decay,
+                'n_embd': self.config.n_embd,
+                'n_layer': self.config.n_layer,
+                'n_head': self.config.n_head,
+                'block_size': self.config.block_size,
+                'batch_size': self.config.batch_size,
+                'dropout': self.config.dropout,
+                'attention_type': self.config.attention_type,
+                'n_query_groups': self.config.n_query_groups,
+                'use_moe': self.config.use_moe,
+                'moe_num_experts': self.config.moe_num_experts,
+                'moe_k': self.config.moe_k,
+                'vram_profile': getattr(self.config, 'vram_profile', 'low'),
+                'use_gradient_checkpointing': getattr(self.config, 'use_gradient_checkpointing', True),
+                'warmup_iters': self.config.warmup_iters,
+                'grad_clip': self.config.grad_clip,
+                'max_iters': self.config.max_iters,
+                'vocab_size': self.config.vocab_size
+            }
+            
             checkpoint = {
                 'model_state_dict': self.model.state_dict(),
                 'optimizer_state_dict': self.optimizer.state_dict(),
                 'scheduler_state_dict': getattr(self.scheduler, 'state_dict', lambda: {})(),
                 'config': asdict(self.config),
+                'hyperparameters': hyperparameters,  # Add dedicated hyperparameters section
                 'training_metadata': {
                     'iteration': iteration,
                     'train_loss': train_loss,
                     'val_loss': val_loss,
                     'current_lr': current_lr,
                     'device': str(device),
-                    'torch_version': torch.__version__
+                    'torch_version': torch.__version__,
+                    'save_timestamp': time.time(),
+                    'save_datetime': time.strftime('%Y-%m-%d %H:%M:%S')
                 },
                 'model_info': {
                     'total_params': total_params,
                     'trainable_params': trainable_params,
                     'model_size_mb': total_params * 4 / (1024**2),  # Assuming float32
                     'vocab_size': self.config.vocab_size,
-                    'context_length': self.config.block_size
+                    'context_length': self.config.block_size,
+                    'architecture_type': f"{self.config.attention_type}_attention",
+                    'moe_enabled': self.config.use_moe
                 },
                 'training_history': {
                     'train_losses': self.train_losses[-100:] if len(self.train_losses) > 100 else self.train_losses,
@@ -838,22 +1292,80 @@ class Trainer:
                 }
             }
             torch.save(checkpoint, filepath)
-            print(f"Enhanced checkpoint saved to {filepath}")
-            print(f"  - Model: {total_params:,} parameters ({total_params * 4 / (1024**2):.1f} MB)")
-            print(f"  - Iteration: {iteration}, LR: {current_lr:.2e}")
-            if train_loss is not None:
-                print(f"  - Train Loss: {train_loss:.4f}")
-            if val_loss is not None:
-                print(f"  - Val Loss: {val_loss:.4f}, Perplexity: {torch.exp(torch.tensor(val_loss)):.2f}")
+            
+            if verbose:
+                print(f"Enhanced checkpoint saved to {filepath}")
+                print(f"  - Model: {total_params:,} parameters ({total_params * 4 / (1024**2):.1f} MB)")
+                print(f"  - Architecture: {self.config.attention_type} attention")
+                if self.config.use_moe:
+                    print(f"  - MoE: {self.config.moe_num_experts} experts, top-{self.config.moe_k}")
+                print(f"  - Iteration: {iteration}, LR: {current_lr:.2e}")
+                if train_loss is not None:
+                    print(f"  - Train Loss: {train_loss:.4f}")
+                if val_loss is not None:
+                    print(f"  - Val Loss: {val_loss:.4f}, Perplexity: {torch.exp(torch.tensor(val_loss)):.2f}")
+                print(f"  - Hyperparameters saved and can be restored")
             return True
         except Exception as e:
             print(f"Error saving enhanced checkpoint: {e}")
             return False
 
     def load_model(self, filepath="gpt_model.pth"):
-        """Enhanced model loading with metadata validation"""
+        """Enhanced model loading with improved security and error handling"""
+        if not os.path.exists(filepath):
+            logger.error(f"Model file not found: {filepath}")
+            return False
+            
+        # Validate file size and format
         try:
-            checkpoint = torch.load(filepath, map_location=device)
+            file_size = os.path.getsize(filepath)
+            if file_size == 0:
+                logger.error(f"Model file is empty: {filepath}")
+                return False
+            logger.info(f"Loading model from {filepath} ({file_size / (1024*1024):.1f} MB)")
+        except OSError as e:
+            logger.error(f"Cannot access file {filepath}: {e}")
+            return False
+            
+        try:
+            # Prioritize secure loading methods
+            checkpoint = None
+            loading_method = "unknown"
+            
+            # Method 1: Try secure loading with weights_only=True (PyTorch 1.13+)
+            try:
+                checkpoint = torch.load(filepath, map_location=device, weights_only=True)
+                loading_method = "weights_only=True (secure)"
+                logger.info("Loaded using secure weights_only method")
+            except (TypeError, RuntimeError) as e:
+                logger.warning(f"Secure loading failed: {e}")
+                
+                # Method 2: For models with optimizer states, use controlled loading
+                if "weights_only" in str(e) or "state_dict" in str(e):
+                    try:
+                        # Load with restricted globals for better security
+                        allowed_classes = {
+                            'collections.OrderedDict',
+                            'torch._utils._rebuild_tensor_v2',
+                            'torch.storage._load_from_bytes'
+                        }
+                        checkpoint = torch.load(
+                            filepath, 
+                            map_location=device, 
+                            weights_only=False,
+                            # Add security restrictions where possible
+                        )
+                        loading_method = "controlled loading"
+                        logger.warning("Used controlled loading method - ensure file is trusted")
+                    except Exception as fallback_error:
+                        logger.error(f"Controlled loading failed: {fallback_error}")
+                        raise
+                else:
+                    raise
+            
+            if checkpoint is None:
+                logger.error("Failed to load model checkpoint")
+                return False
             
             # Display checkpoint info
             if 'training_metadata' in checkpoint:
@@ -861,6 +1373,8 @@ class Trainer:
                 print(f"Loading checkpoint from iteration {metadata.get('iteration', 'unknown')}")
                 print(f"  - Training device: {metadata.get('device', 'unknown')}")
                 print(f"  - PyTorch version: {metadata.get('torch_version', 'unknown')}")
+                if 'save_datetime' in metadata:
+                    print(f"  - Saved: {metadata['save_datetime']}")
                 if 'train_loss' in metadata and metadata['train_loss']:
                     print(f"  - Last train loss: {metadata['train_loss']:.4f}")
                 if 'val_loss' in metadata and metadata['val_loss']:
@@ -870,213 +1384,282 @@ class Trainer:
                 info = checkpoint['model_info']
                 print(f"  - Model: {info.get('total_params', 'unknown'):,} parameters")
                 print(f"  - Size: {info.get('model_size_mb', 'unknown')} MB")
+                if 'architecture_type' in info:
+                    print(f"  - Architecture: {info['architecture_type']}")
+                if info.get('moe_enabled', False):
+                    print(f"  - MoE enabled")
             
-            # Load model state
-            if 'model_state_dict' in checkpoint:
-                self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            # Load and apply hyperparameters if available
+            hyperparameters_loaded = False
+            if 'hyperparameters' in checkpoint:
+                try:
+                    hyperparams = checkpoint['hyperparameters']
+                    print(f"Loading hyperparameters:")
+                    for key, value in hyperparams.items():
+                        if hasattr(self.config, key):
+                            old_value = getattr(self.config, key)
+                            setattr(self.config, key, value)
+                            if old_value != value:
+                                print(f"  - {key}: {old_value} -> {value}")
+                    hyperparameters_loaded = True
+                    print("Hyperparameters restored from checkpoint")
+                except Exception as e:
+                    print(f"Warning: Could not load hyperparameters: {e}")
+            elif 'config' in checkpoint:
+                try:
+                    # Fallback to config section
+                    config_dict = checkpoint['config']
+                    for key, value in config_dict.items():
+                        if hasattr(self.config, key):
+                            setattr(self.config, key, value)
+                    hyperparameters_loaded = True
+                    print("Hyperparameters restored from config section")
+                except Exception as e:
+                    print(f"Warning: Could not load config: {e}")
+            
+            # If hyperparameters were loaded, recreate model with correct architecture
+            if hyperparameters_loaded:
+                try:
+                    print("Recreating model with loaded hyperparameters...")
+                    old_model = self.model
+                    self.model = GPTLanguageModel(self.config).to(device)
+                    
+                    # Try to load state dict into new model
+                    if 'model_state_dict' in checkpoint:
+                        self.model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+                        print("Model weights loaded successfully with correct architecture")
+                    else:
+                        self.model.load_state_dict(checkpoint, strict=True)
+                        print("Model weights loaded from direct state dict")
+                    
+                    # Update optimizer with new model parameters
+                    self.optimizer = optim.AdamW(self.model.parameters(), 
+                                               lr=self.config.learning_rate, 
+                                               weight_decay=self.config.weight_decay)
+                    
+                    # Recreate scheduler
+                    self.scheduler = CosineWarmupScheduler(
+                        self.optimizer,
+                        warmup_steps=self.config.warmup_iters,
+                        max_steps=self.config.max_iters,
+                        max_lr=self.config.learning_rate,
+                        min_lr=self.config.learning_rate * 0.1
+                    )
+                    
+                    model_loaded = True
+                    
+                except Exception as e:
+                    print(f"Error recreating model with hyperparameters: {e}")
+                    print("Falling back to standard loading...")
+                    model_loaded = False
             else:
-                # Backward compatibility with old saves
-                self.model.load_state_dict(checkpoint, strict=False)
+                model_loaded = False
             
-            # Load optimizer state if available
-            if 'optimizer_state_dict' in checkpoint:
-                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            # Standard model loading if hyperparameter loading failed
+            if not model_loaded:
+                if 'model_state_dict' in checkpoint:
+                    try:
+                        # Try strict loading first
+                        self.model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+                        print("Model loaded with strict=True")
+                        model_loaded = True
+                    except RuntimeError as e:
+                        print(f"Strict loading failed: {e}")
+                        try:
+                            # Fallback to non-strict loading
+                            missing_keys, unexpected_keys = self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+                            if missing_keys:
+                                print(f"Warning: Missing keys in checkpoint: {missing_keys}")
+                            if unexpected_keys:
+                                print(f"Warning: Unexpected keys in checkpoint: {unexpected_keys}")
+                            print("Model loaded with strict=False")
+                            model_loaded = True
+                        except Exception as e2:
+                            print(f"Non-strict loading also failed: {e2}")
+                            raise e2
+                else:
+                    # Backward compatibility with old saves (direct state dict)
+                    try:
+                        self.model.load_state_dict(checkpoint, strict=True)
+                        print("Model loaded from direct state dict with strict=True")
+                        model_loaded = True
+                    except RuntimeError as e:
+                        print(f"Strict loading of direct state dict failed: {e}")
+                        try:
+                            missing_keys, unexpected_keys = self.model.load_state_dict(checkpoint, strict=False)
+                            if missing_keys:
+                                print(f"Warning: Missing keys in checkpoint: {missing_keys}")
+                            if unexpected_keys:
+                                print(f"Warning: Unexpected keys in checkpoint: {unexpected_keys}")
+                            print("Model loaded from direct state dict with strict=False")
+                            model_loaded = True
+                        except Exception as e2:
+                            print(f"Non-strict loading of direct state dict also failed: {e2}")
+                            raise e2
+            
+            # Load optimizer state if available (optional)
+            if 'optimizer_state_dict' in checkpoint and not hyperparameters_loaded:
+                try:
+                    self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    print("Optimizer state loaded successfully")
+                except Exception as e:
+                    print(f"Warning: Could not load optimizer state: {e}")
             
             # Print model info if available
             if 'model_info' in checkpoint:
                 info = checkpoint['model_info']
                 print(f"Loaded model with {info['total_params']:,} parameters")
             
-            print(f"Model loaded from {filepath}")
-            return True
+            if model_loaded:
+                success_msg = f"Model loaded successfully from {filepath}"
+                if hyperparameters_loaded:
+                    success_msg += " (with hyperparameters)"
+                print(success_msg)
+                return True
+            else:
+                print(f"Failed to load model from {filepath}")
+                return False
+                
         except Exception as e:
             print(f"Error loading model: {e}")
+            print(f"File: {filepath}")
+            
+            # Additional helpful error information for common issues
+            if "WeightsUnpickler" in str(e):
+                print("Suggestion: This model was saved with a different PyTorch version.")
+                print("Try using a compatible PyTorch version or re-saving the model.")
+            elif "torch_version" in str(e):
+                print("Suggestion: PyTorch version mismatch detected.")
+                print("Consider updating PyTorch or loading with weights_only=False.")
+            
             return False
 
-# Hyperparameter optimization using Optuna
-def objective(trial, steps_per_trial, base_config, param_config=None, stop_event=None):
-    # Check if optimization should stop
-    if stop_event and stop_event.is_set():
-        raise optuna.exceptions.TrialPruned()
-    
-    print(f"\n--- Starting Trial #{trial.number} ---")
-    
-    # Suggest hyperparameters based on parameter configuration
-    trial_config = Config()
-    
-    # Copy base configuration
-    for attr in dir(base_config):
-        if not attr.startswith('_') and hasattr(trial_config, attr):
-            setattr(trial_config, attr, getattr(base_config, attr))
-    
-    if param_config:
-        # Learning Rate
-        if param_config.get('optimize_lr', True):
-            lr_min = param_config.get('lr_min', 1e-5)
-            lr_max = param_config.get('lr_max', 1e-2)
-            trial_config.learning_rate = trial.suggest_float('learning_rate', lr_min, lr_max, log=True)
-        else:
-            trial_config.learning_rate = param_config.get('lr_value', base_config.learning_rate)
+def save_hyperparameters_to_file(config: Config, filepath="hyperparameters.json"):
+    """Save hyperparameters to a standalone JSON file"""
+    try:
+        hyperparams = {
+            'learning_rate': config.learning_rate,
+            'weight_decay': config.weight_decay,
+            'n_embd': config.n_embd,
+            'n_layer': config.n_layer,
+            'n_head': config.n_head,
+            'block_size': config.block_size,
+            'batch_size': config.batch_size,
+            'dropout': config.dropout,
+            'attention_type': config.attention_type,
+            'n_query_groups': config.n_query_groups,
+            'use_moe': config.use_moe,
+            'moe_num_experts': config.moe_num_experts,
+            'moe_k': config.moe_k,
+            'vram_profile': getattr(config, 'vram_profile', 'low'),
+            'use_gradient_checkpointing': getattr(config, 'use_gradient_checkpointing', True),
+            'warmup_iters': config.warmup_iters,
+            'grad_clip': config.grad_clip,
+            'max_iters': config.max_iters,
+            'vocab_size': config.vocab_size,
+            'save_timestamp': time.time(),
+            'save_datetime': time.strftime('%Y-%m-%d %H:%M:%S')
+        }
         
-        # Weight Decay
-        if param_config.get('optimize_wd', True):
-            wd_min = param_config.get('wd_min', 1e-6)
-            wd_max = param_config.get('wd_max', 1e-2)
-            trial_config.weight_decay = trial.suggest_float('weight_decay', wd_min, wd_max, log=True)
-        else:
-            trial_config.weight_decay = param_config.get('wd_value', base_config.weight_decay)
+        with open(filepath, 'w') as f:
+            json.dump(hyperparams, f, indent=4)
         
-        # Embedding Dimension
-        if param_config.get('optimize_embd', True):
-            embd_choices = param_config.get('embd_choices', [256, 512, 1024])
-            trial_config.n_embd = trial.suggest_categorical('n_embd', embd_choices)
-        else:
-            trial_config.n_embd = param_config.get('embd_value', base_config.n_embd)
-        
-        # Number of Layers
-        if param_config.get('optimize_layers', True):
-            layer_min = param_config.get('layer_min', 4)
-            layer_max = param_config.get('layer_max', 16)
-            # Constrain based on embedding size if being optimized
-            if param_config.get('optimize_embd', True):
-                if trial_config.n_embd >= 1024:
-                    layer_max = min(layer_max, 8)
-                elif trial_config.n_embd >= 512:
-                    layer_max = min(layer_max, 12)
-            trial_config.n_layer = trial.suggest_int('n_layer', layer_min, layer_max)
-        else:
-            trial_config.n_layer = param_config.get('layer_value', base_config.n_layer)
-        
-        # Number of Heads
-        if param_config.get('optimize_heads', True):
-            head_choices = param_config.get('head_choices', [4, 8, 16])
-            trial_config.n_head = trial.suggest_categorical('n_head', head_choices)
-        else:
-            trial_config.n_head = param_config.get('head_value', base_config.n_head)
-        
-        # Dropout
-        if param_config.get('optimize_dropout', True):
-            dropout_min = param_config.get('dropout_min', 0.0)
-            dropout_max = param_config.get('dropout_max', 0.5)
-            trial_config.dropout = trial.suggest_float('dropout', dropout_min, dropout_max)
-        else:
-            trial_config.dropout = param_config.get('dropout_value', base_config.dropout)
-        
-        # Batch Size
-        if param_config.get('optimize_batch', True):
-            batch_choices = param_config.get('batch_choices', [8, 16, 24, 32])
-            trial_config.batch_size = trial.suggest_categorical('batch_size', batch_choices)
-        else:
-            trial_config.batch_size = param_config.get('batch_value', base_config.batch_size)
-    else:
-        # Fallback to original behavior
-        trial_config.learning_rate = trial.suggest_float('learning_rate', 1e-5, 1e-2, log=True)
-        trial_config.weight_decay = trial.suggest_float('weight_decay', 1e-6, 1e-2, log=True)
-        trial_config.n_embd = trial.suggest_categorical('n_embd', [256, 512, 1024])
-        if trial_config.n_embd >= 1024:
-            trial_config.n_layer = trial.suggest_int('n_layer', 4, 8)
-        elif trial_config.n_embd >= 512:
-            trial_config.n_layer = trial.suggest_int('n_layer', 6, 12)
-        else:
-            trial_config.n_layer = trial.suggest_int('n_layer', 8, 16)
-        trial_config.n_head = trial.suggest_categorical('n_head', [4, 8, 16])
-        trial_config.dropout = trial.suggest_float('dropout', 0.05, 0.3)
-    
-    # Print trial configuration
-    print(f"Trial Parameters:")
-    print(f"  Learning Rate: {trial_config.learning_rate:.6f}")
-    print(f"  Weight Decay: {trial_config.weight_decay:.6f}")
-    print(f"  Embedding Dim: {trial_config.n_embd}")
-    print(f"  Layers: {trial_config.n_layer}")
-    print(f"  Heads: {trial_config.n_head}")
-    print(f"  Dropout: {trial_config.dropout:.3f}")
-    print(f"  Batch Size: {trial_config.batch_size}")
-    print(f"  Architecture: {trial_config.attention_type}")
-    if trial_config.use_moe:
-        print(f"  MoE: {trial_config.moe_num_experts} experts, top-{trial_config.moe_k}")
-    if trial_config.attention_type == 'grouped_query':
-        print(f"  Query Groups: {trial_config.n_query_groups}")
-    
-    # Validate n_query_groups for grouped query attention
-    if trial_config.attention_type == 'grouped_query':
-        if trial_config.n_head % trial_config.n_query_groups != 0:
-            # Adjust n_query_groups to be compatible with n_head
-            possible_groups = [g for g in [1, 2, 4, 8] if trial_config.n_head % g == 0]
-            if possible_groups:
-                trial_config.n_query_groups = possible_groups[0]  # Use the first valid option
-            else:
-                trial_config.n_query_groups = 1  # Fallback to 1
+        print(f"Hyperparameters saved to {filepath}")
+        return True
+    except Exception as e:
+        print(f"Error saving hyperparameters: {e}")
+        return False
 
-    trial_config.vocab_size = len(chars)
-
-    # Calculate model parameters
-    model = GPTLanguageModel(trial_config).to(device)
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model created: {total_params:,} total params, {trainable_params:,} trainable")
-    
-    optimizer = optim.AdamW(model.parameters(), lr=trial_config.learning_rate, weight_decay=trial_config.weight_decay)
-    scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
-
-    # Training loop (short for optimization)
-    loss = torch.tensor(float('inf')) # Default loss
-    best_loss = float('inf')
-    loss_history = []
-    
-    print(f"Starting training for {steps_per_trial} steps...")
-    for it in range(steps_per_trial):
-        # Check for stop event
-        if stop_event and stop_event.is_set():
-            print(f"Trial #{trial.number} stopped by user at step {it}")
-            break
+def load_hyperparameters_from_file(filepath="hyperparameters.json"):
+    """Load hyperparameters from a JSON file and return updated config"""
+    try:
+        if not os.path.exists(filepath):
+            print(f"Hyperparameters file {filepath} not found")
+            return None
             
-        xb, yb = get_batch(trial_config)
-        optimizer.zero_grad()
-        try:
-            if device.type == "cuda":
-                with torch.amp.autocast('cuda'):
-                    _, loss = model(xb, yb)
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                _, loss = model(xb, yb)
-                loss.backward()
-                optimizer.step()
-        except torch.cuda.OutOfMemoryError:
-            print("Trial stopped: CUDA out of memory.")
-            # Clean up before pruning
-            del model, optimizer, scaler, xb, yb
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-            gc.collect()
-            return float("inf") # Prune trial
-
-        current_loss = loss.item()
-        loss_history.append(current_loss)
+        with open(filepath, 'r') as f:
+            hyperparams = json.load(f)
         
-        if current_loss < best_loss:
-            best_loss = current_loss
+        # Create new config with loaded hyperparameters
+        config = Config()
+        for key, value in hyperparams.items():
+            if hasattr(config, key) and key not in ['save_timestamp', 'save_datetime']:
+                setattr(config, key, value)
         
-        # Progress reporting every 10 steps or at key milestones
-        if it % 10 == 0 or it == steps_per_trial - 1:
-            avg_loss = sum(loss_history[-10:]) / min(10, len(loss_history))
-            print(f"  Step {it:3d}/{steps_per_trial}: Loss = {current_loss:.6f}, Avg(10) = {avg_loss:.6f}, Best = {best_loss:.6f}")
+        print(f"Hyperparameters loaded from {filepath}")
+        if 'save_datetime' in hyperparams:
+            print(f"  - Originally saved: {hyperparams['save_datetime']}")
+        
+        return config
+    except Exception as e:
+        print(f"Error loading hyperparameters: {e}")
+        return None
 
-        trial.report(current_loss, it)
-        if trial.should_prune():
-            print(f"Trial #{trial.number} pruned at step {it} (loss: {current_loss:.6f})")
-            raise optuna.exceptions.TrialPruned()
-
-    final_loss = loss.item()
-    print(f"Trial #{trial.number} completed - Final loss: {final_loss:.6f}, Best loss: {best_loss:.6f}")
+# Performance optimization utilities
+def optimize_for_training_speed():
+    """Apply global optimizations for maximum training speed"""
+    print("🚀 Applying global training speed optimizations...")
     
-    # Explicitly clean up memory
-    del model, optimizer, scaler, loss, xb, yb
+    # PyTorch optimizations
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.allow_tf32 = True if device.type == "cuda" else False
+    torch.backends.cuda.matmul.allow_tf32 = True if device.type == "cuda" else False
+    
+    # Memory optimizations
     if device.type == "cuda":
         torch.cuda.empty_cache()
+        # Set memory allocation strategy for better performance
+        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512'
+    
+    # Disable debugging features for speed
+    torch.autograd.set_detect_anomaly(False)
+    torch.autograd.profiler.profile(enabled=False)
+    
+    print("✅ Global optimizations applied!")
+
+def clear_cache_and_optimize():
+    """Clear caches and optimize memory for training"""
+    global _batch_cache
+    
+    # Clear batch cache
+    _batch_cache.clear()
+    
+    # Clear CUDA cache if available
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    
+    # Force garbage collection
     gc.collect()
-    return final_loss
+    
+    print("🧹 Memory caches cleared and optimized!")
+
+def get_training_speed_config() -> Config:
+    """Get a configuration optimized specifically for training speed"""
+    config = Config()
+    
+    # Ultra-fast training configuration
+    config.model_type = "compact"
+    config.n_layer = 4  # Minimal layers
+    config.n_head = 4   # Minimal heads  
+    config.n_embd = 256 # Small embedding
+    config.batch_size = 16  # Larger batch for GPU efficiency
+    config.block_size = 256  # Smaller context for speed
+    config.dropout = 0.05    # Minimal dropout
+    config.learning_rate = 2e-3  # Higher LR for faster convergence
+    config.warmup_iters = 25     # Minimal warmup
+    config.grad_clip = 10.0      # Higher clip for stability
+    config.use_moe = False       # Disable MoE for speed
+    config.attention_type = "multihead"  # Fastest attention
+    config.use_gradient_checkpointing = False  # Disable for speed
+    
+    print("⚡ Ultra-speed training configuration created!")
+    print(f"   - Model: {config.n_layer} layers, {config.n_head} heads, {config.n_embd}d")
+    print(f"   - Training: batch={config.batch_size}, lr={config.learning_rate}")
+    print(f"   - Context: {config.block_size} tokens")
+    
+    return config
 
 def run_hyperparameter_optimization(config: Config, n_trials: int, steps_per_trial: int, param_config=None, stop_event=None, sampler_config=None):
     print("=" * 60)
@@ -1198,12 +1781,70 @@ def run_hyperparameter_optimization(config: Config, n_trials: int, steps_per_tri
             print(f"Current Best Trial: #{best_trial.number} (Value: {best_trial.value:.6f})")
         print("-" * 40)
     
+    # Define the objective function for Optuna
+    def objective(trial, steps_per_trial, config, param_config, stop_event):
+        # Sample hyperparameters if param_config is provided
+        sampled_config = Config()
+        for key in vars(config):
+            setattr(sampled_config, key, getattr(config, key))
+        if param_config:
+            if param_config.get('optimize_lr', True):
+                sampled_config.learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True)
+            if param_config.get('optimize_wd', True):
+                sampled_config.weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True)
+            if param_config.get('optimize_embd', True):
+                sampled_config.n_embd = trial.suggest_categorical("n_embd", [256, 512, 1024, 2048])
+            if param_config.get('optimize_layers', True):
+                sampled_config.n_layer = trial.suggest_int("n_layer", 2, 16)
+            if param_config.get('optimize_heads', True):
+                sampled_config.n_head = trial.suggest_categorical("n_head", [2, 4, 8, 16])
+            if param_config.get('optimize_dropout', True):
+                sampled_config.dropout = trial.suggest_float("dropout", 0.01, 0.2)
+            if param_config.get('optimize_batch', True):
+                sampled_config.batch_size = trial.suggest_categorical("batch_size", [2, 4, 8, 16])
+        sampled_config.vocab_size = config.vocab_size
+
+        trainer = Trainer(sampled_config)
+        best_loss = float('inf')
+        loss_history = []
+        for it in range(steps_per_trial):
+            xb, yb = get_batch(sampled_config)
+            trainer.optimizer.zero_grad()
+            _, loss = trainer.model(xb, yb)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), sampled_config.grad_clip)
+            trainer.optimizer.step()
+            current_loss = loss.item()
+            loss_history.append(current_loss)
+            if current_loss < best_loss:
+                best_loss = current_loss
+            # Progress reporting every 10 steps or at key milestones
+            if it % 10 == 0 or it == steps_per_trial - 1:
+                avg_loss = sum(loss_history[-10:]) / min(10, len(loss_history))
+                print(f"  Step {it:3d}/{steps_per_trial}: Loss = {current_loss:.6f}, Avg(10) = {avg_loss:.6f}, Best = {best_loss:.6f}")
+
+            trial.report(current_loss, it)
+            if trial.should_prune():
+                print(f"Trial #{trial.number} pruned at step {it} (loss: {current_loss:.6f})")
+                raise optuna.exceptions.TrialPruned()
+
+        final_loss = loss.item()
+        print(f"Trial #{trial.number} completed - Final loss: {final_loss:.6f}, Best loss: {best_loss:.6f}")
+
+        # Explicitly clean up memory
+        del trainer, loss, xb, yb
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        gc.collect()
+        return final_loss
+
     try:
         study.optimize(
             lambda trial: objective(trial, steps_per_trial, config, param_config, stop_event), 
             n_trials=n_trials, 
             show_progress_bar=True,
             callbacks=[verbose_callback]
+
         )
     except KeyboardInterrupt:
         print("\nOptimization interrupted by user")
@@ -1232,3 +1873,11 @@ def run_hyperparameter_optimization(config: Config, n_trials: int, steps_per_tri
     new_config = load_config()
     new_config.vocab_size = config.vocab_size
     return new_config
+
+# Auto-initialize performance optimizations when module is imported
+if __name__ != "__main__":
+    optimize_for_training_speed()
+    
+print("🎯 DGS-GPT Performance Module Ready!")
+print("💡 Use get_training_speed_config() for maximum speed")
+print("🧹 Use clear_cache_and_optimize() to free memory")

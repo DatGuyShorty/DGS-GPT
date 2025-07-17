@@ -48,6 +48,7 @@ Thumbs.db
 *.pt
 *.safetensors
 *.bin
+models/
 
 # Data files (should be downloaded/generated)
 *.txt

@@ -1,0 +1,46 @@
+{
+    "generation_settings": {
+        "max_tokens": "200",
+        "temperature": "1",
+        "top_k": "50",
+        "top_p": "0.9",
+        "use_top_k": true,
+        "use_top_p": true,
+        "generation_mode": "standard",
+        "beam_size": "4"
+    },
+    "training_settings": {
+        "iterations": "850000",
+        "plot_step": "50",
+        "batch_size": "2",
+        "eval_iters": "5000",
+        "auto_scroll": true,
+        "vram_profile": "low"
+    },
+    "optimization_settings": {
+        "trials": "10",
+        "steps_per_trial": "100",
+        "optimize_lr": false,
+        "optimize_wd": false,
+        "optimize_embd": false,
+        "optimize_layers": false,
+        "optimize_heads": true,
+        "optimize_dropout": true,
+        "optimize_batch": false,
+        "sampler": "tpe",
+        "pruner": "median"
+    },
+    "architecture_settings": {
+        "use_moe": true,
+        "moe_experts": "4",
+        "moe_k": "1",
+        "attention_type": "grouped_query",
+        "query_groups": "2"
+    },
+    "advanced_settings": {
+        "use_checkpointing": true,
+        "warmup_steps": "500",
+        "auto_save": false,
+        "auto_eval": true
+    }
+}
